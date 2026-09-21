@@ -104,7 +104,7 @@ static struct addr_marker address_markers[] = {
 	[HIGH_KERNEL_NR]	= { 0UL,		"High Kernel Mapping" },
 	[MODULES_VADDR_NR]	= { 0UL,		"Modules" },
 	[MODULES_END_NR]	= { 0UL,		"End Modules" },
-	[FIXADDR_START_NR]	= { FIXADDR_START,	"Fixmap Area" },
+	[FIXADDR_START_NR]	= { 0UL,		"Fixmap Area" },
 	[END_OF_SPACE_NR]	= { -1,			NULL }
 };
 
@@ -530,6 +530,7 @@ static int __init pt_dump_init(void)
 	address_markers[HIGH_KERNEL_NR].start_address = KERNEL_MAP_BASE;
 	address_markers[MODULES_VADDR_NR].start_address = MODULES_VADDR;
 	address_markers[MODULES_END_NR].start_address = MODULES_END;
+	address_markers[FIXADDR_START_NR].start_address = FIXADDR_START;
 #endif
 #ifdef CONFIG_X86_32
 	address_markers[VMALLOC_START_NR].start_address = VMALLOC_START;

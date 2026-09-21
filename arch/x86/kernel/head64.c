@@ -250,7 +250,8 @@ asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode
 	BUILD_BUG_ON(!(RAW_MODULES_VADDR > __START_KERNEL));
 	MAYBE_BUILD_BUG_ON(!(((RAW_MODULES_END - 1) & PGDIR_MASK) ==
 				(__START_KERNEL & PGDIR_MASK)));
-	BUILD_BUG_ON(__fix_to_virt(__end_of_fixed_addresses) <= MODULES_END);
+	BUILD_BUG_ON(RAW_FIXADDR_TOP - (__end_of_fixed_addresses << PAGE_SHIFT) <=
+		     RAW_MODULES_END);
 
 	cr4_init_shadow();
 

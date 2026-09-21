@@ -55,8 +55,19 @@
 extern unsigned long __FIXADDR_TOP;
 #define FIXADDR_TOP	((unsigned long)__FIXADDR_TOP)
 #else
-#define FIXADDR_TOP	(round_up(VSYSCALL_ADDR + PAGE_SIZE, 1<<PMD_SHIFT) - \
+#define RAW_FIXADDR_TOP	(round_up(VSYSCALL_ADDR + PAGE_SIZE, 1<<PMD_SHIFT) - \
 			 PAGE_SIZE)
+/*
+ * The fixmap is part of the kernel mapping and moves with it.  The
+ * VSYSCALL_PAGE slot is only at VSYSCALL_ADDR at RAW_FIXADDR_TOP, so
+ * vsyscall_setup() does not allow EMULATE mode, the one mode that maps it,
+ * when KERNEL_MAP_BASE has moved.
+ */
+#ifdef CONFIG_X86_PIE
+#define FIXADDR_TOP	(KERNEL_MAP_BASE + (RAW_FIXADDR_TOP - __START_KERNEL_map))
+#else
+#define FIXADDR_TOP	RAW_FIXADDR_TOP
+#endif
 #endif
 
 /*
@@ -83,7 +94,7 @@ enum fixed_addresses {
 	FIX_HOLE,
 #else
 #ifdef CONFIG_X86_VSYSCALL_EMULATION
-	VSYSCALL_PAGE = (FIXADDR_TOP - VSYSCALL_ADDR) >> PAGE_SHIFT,
+	VSYSCALL_PAGE = (RAW_FIXADDR_TOP - VSYSCALL_ADDR) >> PAGE_SHIFT,
 #endif
 #endif
 	FIX_DBGP_BASE,

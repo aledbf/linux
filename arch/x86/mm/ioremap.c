@@ -850,7 +850,7 @@ void __init early_ioremap_init(void)
 	pmd_t *pmd;
 
 #ifdef CONFIG_X86_64
-	BUILD_BUG_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
+	BUILD_BUG_ON((RAW_FIXADDR_TOP + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
 #else
 	WARN_ON((fix_to_virt(0) + PAGE_SIZE) & ((1 << PMD_SHIFT) - 1));
 #endif
@@ -865,10 +865,15 @@ void __init early_ioremap_init(void)
 	 * The boot-ioremap range spans multiple pmds, for which
 	 * we are not prepared:
 	 */
+#ifdef CONFIG_X86_64
+	BUILD_BUG_ON(((RAW_FIXADDR_TOP - (FIX_BTMAP_BEGIN << PAGE_SHIFT)) >> PMD_SHIFT)
+		     != ((RAW_FIXADDR_TOP - (FIX_BTMAP_END << PAGE_SHIFT)) >> PMD_SHIFT));
+#else
 #define __FIXADDR_TOP (-PAGE_SIZE)
 	BUILD_BUG_ON((__fix_to_virt(FIX_BTMAP_BEGIN) >> PMD_SHIFT)
 		     != (__fix_to_virt(FIX_BTMAP_END) >> PMD_SHIFT));
 #undef __FIXADDR_TOP
+#endif
 	if (pmd != early_ioremap_pmd(fix_to_virt(FIX_BTMAP_END))) {
 		WARN_ON(1);
 		printk(KERN_WARNING "pmd %p != %p\n",

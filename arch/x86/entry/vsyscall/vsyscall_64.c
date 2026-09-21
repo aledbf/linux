@@ -62,6 +62,16 @@ static int __init vsyscall_setup(char *str)
 		else
 			return -EINVAL;
 
+		/*
+		 * EMULATE maps the vsyscall page through its fixmap slot, which
+		 * is at VSYSCALL_ADDR only while the fixmap is at its link-time
+		 * address.
+		 */
+		if (vsyscall_mode == EMULATE && KERNEL_MAP_BASE != __START_KERNEL_map) {
+			pr_warn("vsyscall=emulate needs the kernel at its link address, using xonly\n");
+			vsyscall_mode = XONLY;
+		}
+
 		if (cpu_feature_enabled(X86_FEATURE_LASS) && vsyscall_mode == EMULATE) {
 			setup_clear_cpu_cap(X86_FEATURE_LASS);
 			pr_warn_once("x86/cpu: Disabling LASS due to vsyscall=emulate\n");
@@ -398,6 +408,6 @@ void __init map_vsyscall(void)
 	if (vsyscall_mode == XONLY)
 		vm_flags_init(&gate_vma, VM_EXEC);
 
-	BUILD_BUG_ON((unsigned long)__fix_to_virt(VSYSCALL_PAGE) !=
-		     (unsigned long)VSYSCALL_ADDR);
+	BUILD_BUG_ON(RAW_FIXADDR_TOP - (VSYSCALL_PAGE << PAGE_SHIFT) !=
+		     VSYSCALL_ADDR);
 }
