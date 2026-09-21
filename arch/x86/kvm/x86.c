@@ -7539,6 +7539,14 @@ static void kvm_inject_exception(struct kvm_vcpu *vcpu)
 				vcpu->arch.exception.error_code,
 				vcpu->arch.exception.injected);
 
+	/*
+	 * The exception is injected from here on, and the vendor hook owns the
+	 * final state: it may deliver the exception, and anything it queues or
+	 * clears while doing so must not be overwritten after it returns.
+	 */
+	vcpu->arch.exception.pending = false;
+	vcpu->arch.exception.injected = true;
+
 	kvm_x86_call(inject_exception)(vcpu);
 }
 
@@ -7686,9 +7694,6 @@ static int kvm_check_and_inject_events(struct kvm_vcpu *vcpu,
 		}
 
 		kvm_inject_exception(vcpu);
-
-		vcpu->arch.exception.pending = false;
-		vcpu->arch.exception.injected = true;
 
 		can_inject = false;
 	}
