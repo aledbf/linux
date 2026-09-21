@@ -1736,6 +1736,14 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	int insn_cnt = bpf_prog->len;
 	bool seen_exit = false;
 	u8 temp[BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY];
+	/*
+	 * The address the code is emitted for.  Until the image is allocated,
+	 * lay the program out at MODULES_VADDR, where execmem will allocate it,
+	 * rather than at 0: every rel32 call or jump to kernel text (helpers,
+	 * return and retpoline thunks, FineIBT BHI stubs) is then in range and
+	 * emitted at its final size wherever the kernel image is mapped.
+	 */
+	u8 *base = image ?: (u8 *)MODULES_VADDR;
 	void __percpu *priv_frame_ptr = NULL;
 	u16 out_stack_arg_cnt, outgoing_rsp;
 	u64 arena_vm_start, user_vm_start;
@@ -1783,7 +1791,7 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 
 	detect_reg_usage(insn, insn_cnt, callee_regs_used);
 
-	emit_prologue(&prog, image, stack_depth,
+	emit_prologue(&prog, base, stack_depth,
 		      bpf_prog_was_classic(bpf_prog), tail_call_reachable,
 		      bpf_is_subprog(bpf_prog), bpf_prog->aux->exception_cb);
 
@@ -1879,7 +1887,7 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 		if (bpf_insn_is_indirect_target(env, bpf_prog, i - 1))
 			EMIT_ENDBR();
 
-		ip = image + addrs[i - 1] + (prog - temp);
+		ip = base + addrs[i - 1] + (prog - temp);
 
 		switch (insn->code) {
 			/* ALU */
@@ -2955,7 +2963,7 @@ emit_jmp:
 			EMIT1(0xC9);         /* leave */
 			bpf_prog->aux->ksym.fp_end = prog - temp;
 
-			emit_return(&prog, image + addrs[i - 1] + (prog - temp));
+			emit_return(&prog, base + addrs[i - 1] + (prog - temp));
 			break;
 
 		default:

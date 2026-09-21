@@ -200,6 +200,7 @@ ifdef CONFIG_FTRACE_MCOUNT_USE_OBJTOOL
 objtool-args-$(CONFIG_HAVE_OBJTOOL_NOP_MCOUNT)		+= --mnop
 endif
 objtool-args-$(CONFIG_UNWINDER_ORC)			+= --orc
+objtool-args-$(CONFIG_X86_PIE)				+= --pie
 objtool-args-$(CONFIG_MITIGATION_RETPOLINE)		+= --retpoline
 objtool-args-$(CONFIG_MITIGATION_RETHUNK)		+= --rethunk
 objtool-args-$(CONFIG_MITIGATION_SLS)			+= --sls

@@ -168,7 +168,13 @@ else
 endif
 
         KBUILD_CFLAGS += -mno-red-zone
+
+ifdef CONFIG_X86_PIE
+        KBUILD_CFLAGS += -fPIE -include $(srctree)/include/linux/hidden.h
+else
         KBUILD_CFLAGS += -mcmodel=kernel
+endif
+
         KBUILD_RUSTFLAGS += -Cno-redzone=y
         KBUILD_RUSTFLAGS += -Ccode-model=kernel
 

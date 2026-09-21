@@ -40,7 +40,7 @@ config X86_64
 
 config FORCE_DYNAMIC_FTRACE
 	def_bool y
-	depends on X86_32
+	depends on X86_32 || X86_PIE
 	depends on FUNCTION_TRACER
 	select DYNAMIC_FTRACE
 	help
@@ -49,6 +49,10 @@ config FORCE_DYNAMIC_FTRACE
 	  generic code, as other architectures still use it. But we
 	  only need to keep it around for x86_64. No need to keep it
 	  for x86_32. For x86_32, force DYNAMIC_FTRACE.
+
+	  The static ftrace entry code compares ftrace_trace_function with
+	  the absolute address of ftrace_stub, which a PIE kernel cannot
+	  do, so X86_PIE forces DYNAMIC_FTRACE too.
 #
 # Arch settings
 #
@@ -2034,12 +2038,6 @@ config PHYSICAL_START
 
 	  Don't change this unless you know what you are doing.
 
-config X86_PIE
-	bool
-	help
-	  Build the kernel position-independent, without absolute references
-	  that tie it to the top 2GB of the address space.
-
 config RELOCATABLE
 	bool "Build a relocatable kernel"
 	default y
@@ -2056,6 +2054,32 @@ config RELOCATABLE
 	  Note: If CONFIG_RELOCATABLE=y, then the kernel runs from the address
 	  it has been loaded at and the compile time physical address
 	  (CONFIG_PHYSICAL_START) is used as the minimum location.
+
+config X86_PIE
+	bool "Build a position-independent kernel" if EXPERT
+	depends on X86_64
+	# Clang addresses the stack protector guard through the GOT under
+	# -fPIE, on every protected function.
+	depends on CC_IS_GCC
+	# The Rust target uses the kernel code model.
+	depends on !RUST
+	# The KASAN and KMSAN shadow layout assumes the image in the top 2GB.
+	depends on !KASAN && !KMSAN
+	select OBJTOOL
+	help
+	  Build the kernel with -fPIE instead of -mcmodel=kernel, so that
+	  it can be relocated at boot out of the top 2GB of the address
+	  space.  Every kernel symbol is addressed %rip-relative or through
+	  a 64-bit absolute relocation, and objtool rejects 32-bit absolute
+	  relocations.
+
+	  The image mapping can only be moved within the rules documented
+	  at KERNEL_MAP_BASE: it has to start in the second to last PUD
+	  entry of a PGD entry in the kernel half, above the direct mapping,
+	  vmalloc and vmemmap.  On its own this option does not move the
+	  kernel, which keeps running at the link address.
+
+	  If unsure, say N.
 
 config RANDOMIZE_BASE
 	bool "Randomize the address of the kernel image (KASLR)"

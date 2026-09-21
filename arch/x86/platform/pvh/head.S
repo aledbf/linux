@@ -184,12 +184,24 @@ SYM_CODE_START(pvh_start_xen)
 	xorl %edx, %edx
 	wrmsr
 
+#ifdef CONFIG_X86_PIE
+	/*
+	 * A PIE kernel has no absolute references in its code, so it can run
+	 * xen_prepare_pvh() from the identity mapping.  That is the mapping
+	 * to use: the PVH page tables map the kernel only at its link-time
+	 * address, which a kernel relocated out of the top 2GB, for example
+	 * because the environment reserves the top of the address space,
+	 * cannot rely on.
+	 */
+	call xen_prepare_pvh
+#else
 	/* Call xen_prepare_pvh() via the kernel virtual mapping */
 	leaq xen_prepare_pvh(%rip), %rax
 	subq phys_base(%rip), %rax
 	addq $__START_KERNEL_map, %rax
 	ANNOTATE_RETPOLINE_SAFE
 	call *%rax
+#endif
 
 	/* startup_64 expects boot_params in %rsi. */
 	lea pvh_bootparams(%rip), %rsi
