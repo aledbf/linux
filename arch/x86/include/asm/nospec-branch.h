@@ -190,7 +190,8 @@
  * RET
  *
  * The two CMPs below check whether RIP points to after the CALL or after the
- * LEA.
+ * LEA.  The bounds are formed %rip-relative in the caller's @scratch register,
+ * which is clobbered.
  *
  * The LFENCE below is to address this particular speculation case:
  *
@@ -212,10 +213,12 @@
  * Note that this LFENCE only occurs if safe-RET was actually interrupted (so
  * it's outside of the normal path).
  */
-#define __HANDLE_INTR_SAFERET(name, pt_regs)		\
-	cmpq	$(name), RIP+pt_regs;			\
+#define __HANDLE_INTR_SAFERET(name, pt_regs, scratch)	\
+	leaq	name(%rip), scratch;			\
+	cmpq	scratch, RIP+pt_regs;			\
 	jb	1f;					\
-	cmpq	$(name)+5, RIP+pt_regs;			\
+	addq	$5, scratch; /* size of the LEA */	\
+	cmpq	scratch, RIP+pt_regs;			\
 	ja	1f;					\
 	lfence;						\
 	leaq	pt_regs, %rdi;				\
@@ -339,11 +342,13 @@
 #define UNTRAIN_RET_FROM_CALL \
 	__UNTRAIN_RET X86_FEATURE_ENTRY_IBPB, __stringify(RESET_CALL_DEPTH_FROM_CALL)
 
-.macro HANDLE_INTR_SAFERET pt_regs
+.macro HANDLE_INTR_SAFERET pt_regs scratch_reg:req
 #ifdef CONFIG_MITIGATION_SRSO
 	ALTERNATIVE_2 "", \
-	__stringify(__HANDLE_INTR_SAFERET(srso_safe_ret, \pt_regs)), X86_FEATURE_SRSO, \
-	__stringify(__HANDLE_INTR_SAFERET(srso_alias_safe_ret, \pt_regs)), X86_FEATURE_SRSO_ALIAS
+	__stringify(__HANDLE_INTR_SAFERET(srso_safe_ret, \pt_regs, \scratch_reg)), \
+	X86_FEATURE_SRSO, \
+	__stringify(__HANDLE_INTR_SAFERET(srso_alias_safe_ret, \pt_regs, \scratch_reg)), \
+	X86_FEATURE_SRSO_ALIAS
 
 #endif
 .endm

@@ -937,7 +937,7 @@ SYM_CODE_START(paranoid_entry)
 	IBRS_ENTER save_reg=%r15
 	UNTRAIN_RET_FROM_CALL
 
-	HANDLE_INTR_SAFERET 8(%rsp)
+	HANDLE_INTR_SAFERET 8(%rsp), %rcx
 
 	RET
 SYM_CODE_END(paranoid_entry)
@@ -1044,9 +1044,10 @@ SYM_CODE_START(error_entry)
 
 	VALIDATE_UNRET_END
 
-	HANDLE_INTR_SAFERET 8(%rsp)
+	HANDLE_INTR_SAFERET 8(%rsp), %rcx
 
-	cmpq	$.Lgs_change, RIP+8(%rsp)
+	leaq	.Lgs_change(%rip), %rcx
+	cmpq	%rcx, RIP+8(%rsp)
 	jne	.Lerror_entry_done_lfence
 
 	/*
@@ -1257,10 +1258,10 @@ SYM_CODE_START(asm_exc_nmi)
 	 * the outer NMI.
 	 */
 
-	movq	$repeat_nmi, %rdx
+	leaq	repeat_nmi(%rip), %rdx
 	cmpq	8(%rsp), %rdx
 	ja	1f
-	movq	$end_repeat_nmi, %rdx
+	leaq	end_repeat_nmi(%rip), %rdx
 	cmpq	8(%rsp), %rdx
 	ja	nested_nmi_out
 1:
@@ -1314,7 +1315,8 @@ nested_nmi:
 	pushq	%rdx
 	pushfq
 	pushq	$__KERNEL_CS
-	pushq	$repeat_nmi
+	leaq	repeat_nmi(%rip), %rdx
+	pushq	%rdx
 
 	/* Put stack back */
 	addq	$(6*8), %rsp
@@ -1353,7 +1355,13 @@ first_nmi:
 	addq	$8, (%rsp)	/* Fix up RSP */
 	pushfq			/* RFLAGS */
 	pushq	$__KERNEL_CS	/* CS */
-	pushq	$1f		/* RIP */
+	/*
+	 * "pushq $1f" would need an absolute address.  Form it %rip-relative
+	 * instead and swap it into place, which leaves %rdx untouched.
+	 */
+	pushq	%rdx
+	leaq	1f(%rip), %rdx
+	xchgq	%rdx, (%rsp)	/* RIP */
 	iretq			/* continues at repeat_nmi below */
 	UNWIND_HINT_IRET_REGS
 1:
