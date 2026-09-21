@@ -84,7 +84,7 @@ int host_mmu_init(void);
 #define PVM_ASID_GEN_INIT		1
 
 /* What PVM_CPUID_FEATURES.ebx reports and MSR_PVM_FEATURES_ENABLED accepts. */
-#define PVM_FEATURES_SUPPORTED		0
+#define PVM_FEATURES_SUPPORTED		PVM_FEATURE_DIRECT_PF
 
 struct vcpu_pvm {
 	struct kvm_vcpu vcpu;
@@ -118,6 +118,18 @@ struct vcpu_pvm {
 	int loaded_cpu_state;
 	int int_shadow;
 	bool non_pvm_mode;
+	/*
+	 * The direct #PF run: how many user-mode #PFs in a row were delivered
+	 * without the shadow MMU, by the switcher or by
+	 * pvm_direct_pf_candidate(), and the page of the last one.  A user
+	 * #PF that reaches kvm-pvm and is not delivered that way ends the
+	 * run; so does a vCPU reset.  Nothing else does: other exits and
+	 * supervisor-mode faults leave it alone, which is safe because the
+	 * rule only needs every retry on the same page and every
+	 * PVM_DIRECT_PF_RUN + 1st user #PF in a run to reach the MMU.
+	 */
+	u8 pf_direct_run;
+	unsigned long pf_direct_page;
 	bool nmi_mask;
 
 	unsigned long guest_dr7;

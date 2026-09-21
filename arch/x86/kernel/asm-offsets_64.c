@@ -75,6 +75,10 @@ int main(void)
 	ENTRY(pgtbl);
 	ENTRY(pgtbl_switched);
 	ENTRY(pgtbl_flags);
+	ENTRY(event_entry);
+	ENTRY(dpf_page);
+	ENTRY(dpf_on);
+	ENTRY(dpf_run);
 	BLANK();
 #undef ENTRY
 	DEFINE(PVM_PGTBL_ENTRY_SIZE, sizeof(struct pvm_pgtbl_entry));

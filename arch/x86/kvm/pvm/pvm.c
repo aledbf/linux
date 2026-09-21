@@ -2447,11 +2447,69 @@ static bool handle_synthetic_instruction_pvm_cpuid(struct kvm_vcpu *vcpu)
 	return false;
 }
 
+/*
+ * Could this #PF have gone straight back to the guest, without the shadow
+ * MMU's guest page table walk?  The hardware's P=0 does not say the guest
+ * entry is absent -- a present guest entry with no SPTE behind it faults the
+ * same way -- so the only faults it may be asked of are those where being
+ * wrong costs the guest a spurious not-present #PF and nothing else: user
+ * mode, not present, no reserved bit, no key, no fetch (NX/SMEP emulation is
+ * the MMU's business), a lower-half address, and nothing pending
+ * that the fault would have to be queued behind.  Only from the 64-bit user
+ * CS and SS, the only pair the switcher delivers from.
+ *
+ * Wrong or not, the guest must not be sent back to the same page twice: a
+ * fault on the page of the candidate before it goes to the shadow MMU, so a
+ * shadow miss the guest cannot fix by itself is fixed on the next exit on
+ * that page.  And no more than PVM_DIRECT_PF_RUN candidates in a row, so
+ * that faults interleaved across pages cannot keep each other away from the
+ * MMU either: at least one user #PF in every PVM_DIRECT_PF_RUN + 1 is
+ * handled exactly as without any of this.
+ *
+ * Not "never two candidates in a row": that locks into the wrong phase, where
+ * after one unpaired fault every fresh page's real fault goes to the MMU and
+ * its shadow miss is the one delivered.
+ *
+ * The switcher applies the same rule to the same state (tss_ex.dpf_run and
+ * tss_ex.dpf_page) in pvm_direct_page_fault in entry_64_switcher.S; the two
+ * must stay identical.  The error code and repeat tests are the helpers in
+ * <asm/pvm_switcher.h>, next to the constants the assembly uses.
+ */
+static bool pvm_direct_pf_candidate(struct vcpu_pvm *pvm, u32 hw_error_code,
+				    unsigned long cr2)
+{
+	struct kvm_vcpu *vcpu = &pvm->vcpu;
+	u8 run = pvm->pf_direct_run;
+
+	BUILD_BUG_ON(PVM_DIRECT_PF_RUN >= U8_MAX);
+	/* A user #PF that reaches here ends the run, unless it extends it below. */
+	pvm->pf_direct_run = 0;
+
+	if (!(pvm->msr_features_enabled & PVM_FEATURE_DIRECT_PF))
+		return false;
+	if (pvm->hw_cs != __USER_CS || pvm->hw_ss != __USER_DS)
+		return false;
+	if (!pvm_direct_pf_error_code(hw_error_code))
+		return false;
+	if (pvm_disallowed_va(vcpu, cr2))
+		return false;
+	if (vcpu->arch.exception.pending || vcpu->arch.exception.injected ||
+	    vcpu->arch.apf.host_apf_flags)
+		return false;
+	if (!pvm_direct_pf_rule(run, pvm->pf_direct_page, cr2))
+		return false;
+
+	pvm->pf_direct_run = run + 1;
+	pvm->pf_direct_page = cr2 & PAGE_MASK;
+	return true;
+}
+
 static int handle_exit_exception(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_pvm *pvm = to_pvm(vcpu);
 	struct kvm_run *kvm_run = vcpu->run;
 	u32 vector, error_code;
+	bool dpf;
 	int err;
 
 	vector = pvm->exit_vector;
@@ -2463,6 +2521,28 @@ static int handle_exit_exception(struct kvm_vcpu *vcpu)
 	 * for emulation or debugging.
 	 */
 	case PF_VECTOR:
+		dpf = !is_smod(pvm) &&
+		      pvm_direct_pf_candidate(pvm, error_code, pvm->exit_cr2);
+		if (dpf) {
+			/*
+			 * What the walk would have injected for an absent
+			 * guest entry: the access bits, P clear, the address.
+			 * If the entry is present after all, the guest takes a
+			 * spurious fault, returns, and the retry comes here
+			 * on the same page and goes to the MMU.
+			 */
+			struct x86_exception fault = {
+				.vector = PF_VECTOR,
+				.error_code_valid = true,
+				.error_code = error_code &
+					      (PFERR_WRITE_MASK | PFERR_USER_MASK),
+				.address = pvm->exit_cr2,
+			};
+
+			kvm_request_l1tf_flush_l1d();
+			__kvm_inject_emulated_page_fault(vcpu, &fault, true);
+			return 1;
+		}
 		/*
 		 * The hardware sets PFERR_USER_MASK for supervisor mode too,
 		 * because the guest runs at CPL3.
@@ -2898,14 +2978,20 @@ static noinstr void pvm_vcpu_run_noinstr(struct kvm_vcpu *vcpu)
 	tss_ex->smod_gsbase = pvm->msr_kernel_gs_base;
 	tss_ex->pku_on = pvm_guest_uses_pku(vcpu);
 	tss_ex->smod_pkru = pvm->smod_pkru;
+	tss_ex->event_entry = pvm->msr_event_entry;
+	tss_ex->dpf_on = !!(pvm->msr_features_enabled & PVM_FEATURE_DIRECT_PF);
+	tss_ex->dpf_run = pvm->pf_direct_run;
+	tss_ex->dpf_page = pvm->pf_direct_page;
 
 	if (unlikely(pvm->guest_dr7 & DR7_BP_EN_MASK))
 		set_debugreg(pvm_eff_dr7(vcpu), 7);
 
 	ret_regs = switcher_enter_guest();
 
-	/* The mode the guest left in. */
+	/* The mode, and the direct #PF rule's state, the guest left in. */
 	pvm->switch_flags = tss_ex->switch_flags;
+	pvm->pf_direct_run = tss_ex->dpf_run;
+	pvm->pf_direct_page = tss_ex->dpf_page;
 
 	save_regs(vcpu, ret_regs);
 	pvm->exit_vector = (ret_regs->orig_ax >> 32);
@@ -3061,9 +3147,9 @@ static fastpath_t pvm_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 	}
 
 	/*
-	 * The guest's own writes put its CR2 into the PVCS, which
-	 * vcpu->arch.cr2 would otherwise never hear of.  Take it back on every
-	 * exit.
+	 * The guest's own writes put its CR2 into the PVCS, and so does a #PF
+	 * the switcher delivered without an exit, which vcpu->arch.cr2 would
+	 * otherwise never hear of.  Take it back on every exit.
 	 */
 	if (likely(pvm->pvcs))
 		vcpu->arch.cr2 = READ_ONCE(pvm->pvcs->cr2);
@@ -3215,6 +3301,8 @@ static void pvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
 	pvm->msr_event_entry = 0;
 	pvm->msr_retu_rip_plus2 = 0;
 	pvm->msr_features_enabled = 0;
+	pvm->pf_direct_run = 0;
+	pvm->pf_direct_page = 0;
 }
 
 static int pvm_vcpu_create(struct kvm_vcpu *vcpu)

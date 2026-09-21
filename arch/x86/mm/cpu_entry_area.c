@@ -238,6 +238,13 @@ static void __init setup_cpu_entry_area(unsigned int cpu)
 	BUILD_BUG_ON(offsetofend(struct tss_struct, tss_ex) > PAGE_SIZE);
 	BUILD_BUG_ON(sizeof(struct tss_struct) !=
 		     PAGE_ALIGN(sizeof(struct x86_hw_tss) + sizeof(struct x86_io_bitmap)));
+	/*
+	 * SP0_TSS_EXTRA() finds the TSS from a user exception's frame: sp0 is
+	 * the top of the entry stack, and the TSS is mapped right above it.
+	 */
+	BUILD_BUG_ON(offsetof(struct cpu_entry_area, tss) !=
+		     offsetof(struct cpu_entry_area, entry_stack_page) +
+		     sizeof(struct entry_stack));
 #endif
 
 	cea_map_percpu_pages(&cea->tss, &per_cpu(cpu_tss_rw, cpu),

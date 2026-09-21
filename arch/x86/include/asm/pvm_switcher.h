@@ -60,6 +60,19 @@
 
 #define SWITCH_FLAGS_MOD_TOGGLE			(SWITCH_FLAGS_SMOD | SWITCH_FLAGS_UMOD)
 
+/*
+ * Direct #PF delivery (PVM_FEATURE_DIRECT_PF): the most user #PFs delivered
+ * without the shadow MMU in a row, and the error code bits of the only faults
+ * delivered without the walk -- user, not present, read or write.  The
+ * error code bits mirror X86_PF_USER and X86_PF_WRITE, which are not usable
+ * from assembly.  pvm_direct_page_fault in entry_64_switcher.S tests them in
+ * assembly, and kvm-pvm through pvm_direct_pf_error_code() and
+ * pvm_direct_pf_rule() below.
+ */
+#define PVM_DIRECT_PF_RUN			4
+#define PVM_DIRECT_PF_ERR_USER			0x4
+#define PVM_DIRECT_PF_ERR_WRITE			0x2
+
 /* PVCS::user_cs and PVCS::user_ss, read or written as one 32-bit word. */
 #define PVCS_USER_CS_SS				((__USER_DS << 16) | __USER_CS)
 
@@ -91,7 +104,42 @@
 #define SWITCH_ENTER_EFLAGS_FIXED	(X86_EFLAGS_FIXED | X86_EFLAGS_IF)
 
 #ifndef __ASSEMBLER__
+#include <linux/build_bug.h>
 #include <linux/cache.h>
+#include <asm/page_types.h>
+#include <asm/trap_pf.h>
+
+static_assert(PVM_DIRECT_PF_ERR_USER == X86_PF_USER);
+static_assert(PVM_DIRECT_PF_ERR_WRITE == X86_PF_WRITE);
+
+/*
+ * The direct #PF rule in C, for the hypervisor's exit handler.  The switcher's
+ * pvm_direct_page_fault is the same rule in assembly, on the same constants
+ * and on the same state (tss_extra.dpf_run and dpf_page); change both
+ * together.
+ *
+ * Only a user, not-present read or write: no P, RSVD, PK or fetch bit, and
+ * no other bit either.
+ */
+static inline bool pvm_direct_pf_error_code(u32 error_code)
+{
+	return error_code == PVM_DIRECT_PF_ERR_USER ||
+	       error_code == (PVM_DIRECT_PF_ERR_USER | PVM_DIRECT_PF_ERR_WRITE);
+}
+
+/*
+ * Not the page of the previous delivery, and fewer than PVM_DIRECT_PF_RUN
+ * deliveries in a row.  @run is the number of deliveries in a row so far and
+ * @page the page of the last one.
+ */
+static inline bool pvm_direct_pf_rule(u32 run, unsigned long page,
+				      unsigned long addr)
+{
+	if (run && (addr & PAGE_MASK) == page)
+		return false;
+
+	return run < PVM_DIRECT_PF_RUN;
+}
 
 struct pt_regs;
 struct pvm_vcpu_struct;
@@ -186,6 +234,18 @@ struct tss_extra {
 	 */
 	u32 pku_on;
 	u32 smod_pkru;
+
+	/*
+	 * Direct #PF delivery: the guest's user event entry, whether the
+	 * switcher may deliver at all, and the state of the rule that keeps
+	 * it from sending the guest back to the same page (kvm-pvm's
+	 * pvm_direct_pf_candidate(), which it shares with the switcher by
+	 * copying it in and out around every run).
+	 */
+	unsigned long event_entry;
+	unsigned long dpf_page;
+	u32 dpf_on;
+	u32 dpf_run;
 } ____cacheline_aligned;
 
 extern struct pt_regs *switcher_enter_guest(void);

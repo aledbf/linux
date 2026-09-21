@@ -383,6 +383,28 @@ SYM_CODE_START(\asmsym)
 		pushq	$-1			/* ORIG_RAX: no syscall to restart */
 	.endif
 
+#ifdef CONFIG_X86_PVM_SWITCHER
+	.if \vector == X86_TRAP_PF
+		/*
+		 * A #PF from CPL3 on a CPU that runs a PVM guest is the
+		 * guest's, and the switcher may deliver it to the guest
+		 * directly.  GSBASE is still the user's here, so
+		 * TSS_extra(host_rsp) is read through the TSS mapping right
+		 * above the entry stack, where the CPU put this frame.
+		 * pvm_direct_page_fault decides, and comes back to
+		 * pvm_page_fault_slow with every register unchanged when it
+		 * does not deliver.
+		 */
+		ALTERNATIVE "", __stringify(testb $3, CS-ORIG_RAX(%rsp); jz 1f;		\
+					    cmpq $0, SP0_TSS_EXTRA(host_rsp, 0);	\
+					    jne pvm_direct_page_fault; 1:),		\
+			    X86_FEATURE_PVM_HOST
+SYM_INNER_LABEL(pvm_page_fault_slow, SYM_L_GLOBAL)
+		UNWIND_HINT_IRET_ENTRY offset=8
+		ANNOTATE_NOENDBR
+	.endif
+#endif
+
 	.if \vector == X86_TRAP_BP
 		/*
 		 * If coming from kernel space, create a 6-word gap to allow the

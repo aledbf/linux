@@ -154,6 +154,15 @@ For 32-bit we have the following conventions - kernel is built with
 #define TSS_extra(field) PER_CPU_VAR(cpu_tss_rw+TSS_EX_##field)
 
 /*
+ * The same field without GSBASE, for an exception from CPL3 whose hardware
+ * frame and error code are at the top of the entry stack and %rsp is
+ * \pushed bytes below the error code: the TSS is mapped in the
+ * cpu_entry_area right above the entry stack, read-only.  Reads only.
+ */
+#define SP0_TSS_EXTRA(field, pushed)					\
+	(SS + 8 - ORIG_RAX + TSS_EX_##field + (pushed))(%rsp)
+
+/*
  * TSS_extra(host_rsp) is non-zero from switcher_enter_guest() until it returns
  * to its caller, and CR3 may be the PVM guest's anywhere in that window.  The
  * guest's page tables map the host kernel, but their lower half is the

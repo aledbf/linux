@@ -6,6 +6,8 @@
 #include <asm/percpu.h>
 #include <asm/nospec-branch.h>
 #include <asm/pvm_switcher.h>
+#include <asm/page_types.h>
+#include <asm/trapnr.h>
 #include <uapi/asm/pvm_para.h>
 
 #include "calling.h"
@@ -111,6 +113,9 @@
 	ALTERNATIVE "shl $(64 - 48), %rcx; sar $(64 - 48), %rcx", \
 		    "shl $(64 - 57), %rcx; sar $(64 - 57), %rcx", X86_FEATURE_LA57
 .endm
+
+/* The hardware #PF frame, as seen after pvm_direct_page_fault's two pushes. */
+#define DPF_PUSHED	16
 
 .code64
 .section .entry.text, "ax"
@@ -418,3 +423,130 @@ SYM_INNER_LABEL(entry_SYSRETQ_switcher_unsafe_stack, SYM_L_GLOBAL)
 	jmp	switcher_return_from_guest
 SYM_CODE_END(entry_SYSCALL_64_switcher)
 EXPORT_SYMBOL_GPL(entry_SYSCALL_64_switcher)
+
+/*
+ * pvm_direct_page_fault - deliver a PVM guest's user #PF without an exit
+ *
+ * Jumped to from asm_exc_page_fault for a #PF from CPL3 on a CPU whose
+ * switcher is running a guest, before anything else: the hardware frame and
+ * error code on the entry stack, every register the guest's, the guest's CR3
+ * and GSBASE.  What it touches -- this text, the TSS, the PVCS -- the guest
+ * root maps as part of the host's kernel half.
+ *
+ * It delivers exactly what kvm-pvm's handle_exit_exception() delivers for a
+ * pvm_direct_pf_candidate() -- __do_pvm_event() for a user #PF with the
+ * hardware's write and user bits -- and makes the same mode switch the
+ * UMOD->SMOD direct syscall does just above.  Anything it does not deliver
+ * goes back to pvm_page_fault_slow with every register as it found it, and
+ * reaches kvm-pvm as an exit.
+ *
+ * Every check reads tss_extra through SP0_TSS_EXTRA(), without GSBASE, so a
+ * fault that is not delivered costs no SWAPGS.  Delivered only when all hold:
+ *  - the error code is user and not-present, read or write: no P, RSVD, PK,
+ *    fetch (NX/SMEP emulation is the shadow MMU's) -- and, as it has the user
+ *    bit, not an async #PF from the L0 hypervisor either, which comes with 0;
+ *    pvm_direct_pf_error_code() in <asm/pvm_switcher.h>;
+ *  - CS and SS are the 64-bit user pair the direct switch knows;
+ *  - the guest enabled PVM_FEATURE_DIRECT_PF, and UMOD->SMOD direct
+ *    switching is allowed (no inhibitor: interrupt window, CR3 not ready);
+ *  - CR2 is in the lower half, the only half a guest owns;
+ *  - the repeat rule, pvm_direct_pf_rule() in <asm/pvm_switcher.h>: not the
+ *    page of the previous delivery, and fewer than PVM_DIRECT_PF_RUN in a
+ *    row.  A fault that loses on the rule reaches kvm-pvm, which applies the
+ *    same rule to the same state and sends it to the shadow MMU.
+ *
+ * pvm_direct_pf_candidate() in kvm-pvm is the same rule in C, built on the
+ * same helpers; a change here must be made there too.
+ */
+SYM_CODE_START(pvm_direct_page_fault)
+	UNWIND_HINT_IRET_ENTRY offset=8
+	ANNOTATE_NOENDBR
+
+	cmpl	$PVM_DIRECT_PF_ERR_USER, ORIG_RAX-ORIG_RAX(%rsp)
+	je	1f
+	cmpl	$(PVM_DIRECT_PF_ERR_USER | PVM_DIRECT_PF_ERR_WRITE), \
+		ORIG_RAX-ORIG_RAX(%rsp)
+	jne	pvm_page_fault_slow
+1:
+	cmpw	$__USER_CS, CS-ORIG_RAX(%rsp)
+	jne	pvm_page_fault_slow
+	cmpw	$__USER_DS, SS-ORIG_RAX(%rsp)
+	jne	pvm_page_fault_slow
+	cmpl	$0, SP0_TSS_EXTRA(dpf_on, 0)
+	je	pvm_page_fault_slow
+	testq	$SWITCH_FLAGS_NO_DS_TO_SMOD, SP0_TSS_EXTRA(switch_flags, 0)
+	jnz	pvm_page_fault_slow
+
+	pushq	%rax
+	pushq	%rdi
+	movq	%cr2, %rdi
+	testq	%rdi, %rdi
+	js	.Ldpf_pop
+	movq	%rdi, %rax
+	andq	$PAGE_MASK, %rax
+	cmpl	$0, SP0_TSS_EXTRA(dpf_run, DPF_PUSHED)
+	je	2f
+	cmpq	%rax, SP0_TSS_EXTRA(dpf_page, DPF_PUSHED)
+	je	.Ldpf_pop
+	cmpl	$PVM_DIRECT_PF_RUN, SP0_TSS_EXTRA(dpf_run, DPF_PUSHED)
+	jae	.Ldpf_pop
+2:
+	/* From here on it is delivered, on the host GSBASE.  CR2 moves to %rax. */
+	swapgs
+	incl	TSS_extra(dpf_run)
+	movq	%rax, TSS_extra(dpf_page)
+	movq	%rdi, %rax
+	movq	TSS_extra(pvcs), %rdi
+
+	/* The guest's own %rcx and %r11: a #PF, unlike SYSCALL, keeps them. */
+	movq	%rcx, PVCS_rcx(%rdi)
+	movq	%r11, PVCS_r11(%rdi)
+	movl	$PVCS_USER_CS_SS, PVCS_user_cs(%rdi)
+	movq	EFLAGS-ORIG_RAX+DPF_PUSHED(%rsp), %rcx
+	movl	%ecx, PVCS_eflags(%rdi)
+	movq	RIP-ORIG_RAX+DPF_PUSHED(%rsp), %rcx
+	movq	%rcx, PVCS_rip(%rdi)
+	movq	ORIG_RAX-ORIG_RAX+DPF_PUSHED(%rsp), %rcx
+	movw	%cx, PVCS_event_errcode(%rdi)
+	movw	$(PVM_PVCS_EVENT_VECTOR_STD | X86_TRAP_PF), PVCS_event_vector(%rdi)
+	movq	%rax, PVCS_cr2(%rdi)
+
+	SWITCHER_PKRU_TO_SMOD
+
+	/* switch umod to smod (switch_flags & cr3) */
+	xorb	$SWITCH_FLAGS_MOD_TOGGLE, TSS_extra(switch_flags)
+	movq	TSS_extra(smod_cr3), %rcx
+	movq	%rcx, %cr3
+
+	/* The user event entry, and the smod GSBASE while TSS_extra is reachable. */
+	movq	TSS_extra(event_entry), %rcx
+	movq	%rcx, RIP-ORIG_RAX+DPF_PUSHED(%rsp)
+	movq	TSS_extra(smod_gsbase), %r11
+
+	/* switch host gsbase to guest gsbase, TSS_extra can't be used afterwards */
+	swapgs
+	rdgsbase %rax
+	movq	%rax, PVCS_user_gsbase(%rdi)
+	wrgsbase %r11
+
+	popq	%rdi
+	popq	%rax
+	addq	$8, %rsp				/* the error code */
+	UNWIND_HINT_IRET_REGS
+
+	/*
+	 * Per the PVM event delivery, %rcx and %r11 carry the entry and the
+	 * flags, so return with SYSRET.  The entry, MSR_PVM_EVENT_ENTRY of the
+	 * guest, is canonical: kvm-pvm refuses a non-canonical value on the
+	 * MSR write.
+	 */
+	movq	$SWITCH_ENTER_EFLAGS_FIXED, %r11
+	movq	RIP-RIP(%rsp), %rcx
+	jmp	.L_switcher_sysretq
+
+.Ldpf_pop:
+	UNWIND_HINT_IRET_ENTRY offset=8+DPF_PUSHED
+	popq	%rdi
+	popq	%rax
+	jmp	pvm_page_fault_slow
+SYM_CODE_END(pvm_direct_page_fault)
