@@ -10,10 +10,225 @@
 
 #include <asm/cpufeature.h>
 #include <asm/cpu_entry_area.h>
+#include <asm/desc.h>
 #include <asm/pvm_para.h>
 #include <asm/setup.h>
+#include <asm/traps.h>
 
 DEFINE_PER_CPU_PAGE_ALIGNED(struct pvm_vcpu_struct, pvm_vcpu_struct);
+static DEFINE_PER_CPU(unsigned long, pvm_guest_cr3);
+
+static __always_inline long pvm_hypercall0(unsigned int nr)
+{
+	long ret;
+
+	asm volatile("call pvm_hypercall"
+		     : ASM_CALL_CONSTRAINT, "=a"(ret)
+		     : "a"(nr)
+		     : "memory");
+	return ret;
+}
+
+static __always_inline long pvm_hypercall1(unsigned int nr, unsigned long p1)
+{
+	long ret;
+
+	asm volatile("call pvm_hypercall"
+		     : ASM_CALL_CONSTRAINT, "=a"(ret)
+		     : "a"(nr), "b"(p1)
+		     : "memory");
+	return ret;
+}
+
+static __always_inline long pvm_hypercall2(unsigned int nr, unsigned long p1,
+					   unsigned long p2)
+{
+	long ret;
+
+	asm volatile("call pvm_hypercall"
+		     : ASM_CALL_CONSTRAINT, "=a"(ret)
+		     : "a"(nr), "b"(p1), "c"(p2)
+		     : "memory");
+	return ret;
+}
+
+static __always_inline long pvm_hypercall3(unsigned int nr, unsigned long p1,
+					   unsigned long p2, unsigned long p3)
+{
+	long ret;
+
+	asm volatile("call pvm_hypercall"
+		     : ASM_CALL_CONSTRAINT, "=a"(ret)
+		     : "a"(nr), "b"(p1), "c"(p2), "d"(p3)
+		     : "memory");
+	return ret;
+}
+
+static void pvm_load_gs_index(unsigned int sel)
+{
+	if (sel & SEGMENT_TI_MASK) {
+		pr_warn_once("pvm guest doesn't support LDT\n");
+		this_cpu_write(pvm_vcpu_struct.user_gsbase, 0);
+	} else {
+		unsigned long base;
+
+		preempt_disable();
+		base = pvm_hypercall1(PVM_HC_LOAD_GS, sel);
+		__this_cpu_write(pvm_vcpu_struct.user_gsbase, base);
+		preempt_enable();
+	}
+}
+
+/* PVM_HC_RDMSR returns a status in RAX and the value in RDX. */
+static __always_inline long pvm_hypercall_rdmsr(u32 msr, u64 *val)
+{
+	unsigned long value;
+	long ret;
+
+	asm volatile("call pvm_hypercall"
+		     : ASM_CALL_CONSTRAINT, "=a"(ret), "=d"(value)
+		     : "a"((unsigned long)PVM_HC_RDMSR), "b"((unsigned long)msr)
+		     : "memory");
+	*val = value;
+	return ret;
+}
+
+static int notrace pvm_read_msr_safe(u32 msr, u64 *val)
+{
+	switch (msr) {
+	case MSR_FS_BASE:
+		*val = rdfsbase();
+		return 0;
+	case MSR_KERNEL_GS_BASE:
+		*val = this_cpu_read(pvm_vcpu_struct.user_gsbase);
+		return 0;
+	default:
+		return pvm_hypercall_rdmsr(msr, val) ? -EIO : 0;
+	}
+}
+
+static u64 notrace pvm_read_msr(u32 msr)
+{
+	u64 val;
+
+	if (pvm_read_msr_safe(msr, &val)) {
+		pr_warn_once("unchecked MSR access error: RDMSR from 0x%x\n", msr);
+		val = 0;
+	}
+	return val;
+}
+
+static int notrace pvm_write_msr_safe(u32 msr, u64 val)
+{
+	unsigned long base = val;
+
+	switch (msr) {
+	case MSR_FS_BASE:
+		wrfsbase(base);
+		return 0;
+	case MSR_KERNEL_GS_BASE:
+		this_cpu_write(pvm_vcpu_struct.user_gsbase, base);
+		return 0;
+	default:
+		return pvm_hypercall2(PVM_HC_WRMSR, msr, base) ? -EIO : 0;
+	}
+}
+
+static void notrace pvm_write_msr(u32 msr, u64 val)
+{
+	if (pvm_write_msr_safe(msr, val))
+		pr_warn_once("unchecked MSR access error: WRMSR to 0x%x (tried to write 0x%016llx)\n",
+			     msr, val);
+}
+
+static void pvm_load_tls(struct thread_struct *t, unsigned int cpu)
+{
+	struct desc_struct *gdt = get_cpu_gdt_rw(cpu);
+	unsigned long *tls_array = (unsigned long *)gdt;
+
+	if (memcmp(&gdt[GDT_ENTRY_TLS_MIN], &t->tls_array[0], sizeof(t->tls_array))) {
+		native_load_tls(t, cpu);
+		pvm_hypercall3(PVM_HC_LOAD_TLS, tls_array[GDT_ENTRY_TLS_MIN],
+			       tls_array[GDT_ENTRY_TLS_MIN + 1],
+			       tls_array[GDT_ENTRY_TLS_MIN + 2]);
+	}
+}
+
+static unsigned long pvm_read_cr3(void)
+{
+	return this_cpu_read(pvm_guest_cr3);
+}
+
+static void pvm_write_cr3(unsigned long val)
+{
+	unsigned long flags = (val & X86_CR3_PCID_NOFLUSH) ? 0 : PVM_LOAD_PGTBL_FLAGS_TLB;
+	unsigned long pgd = val & ~X86_CR3_PCID_NOFLUSH;
+
+	if (pgtable_l5_enabled())
+		flags |= PVM_LOAD_PGTBL_FLAGS_LA57;
+	this_cpu_write(pvm_guest_cr3, pgd);
+	pvm_hypercall2(PVM_HC_LOAD_PGTBL, flags, pgd);
+}
+
+static void pvm_flush_tlb_user(void)
+{
+	pvm_hypercall0(PVM_HC_TLB_FLUSH_CURRENT);
+}
+
+static void pvm_flush_tlb_kernel(void)
+{
+	pvm_hypercall0(PVM_HC_TLB_FLUSH);
+}
+
+static void pvm_flush_tlb_one_user(unsigned long addr)
+{
+	pvm_hypercall1(PVM_HC_TLB_INVLPG, addr);
+}
+
+void __init pvm_early_setup(void)
+{
+	unsigned int eax, ebx, ecx = 0, edx;
+
+	if (!pvm_detected)
+		return;
+
+	/*
+	 * this_cpu_cmpxchg16b_emu(), the fallback for CPUs without
+	 * CMPXCHG16B, relies on POPF restoring IF, which it never does at
+	 * CPL3.
+	 */
+	eax = 1;
+	pvm_cpuid(&eax, &ebx, &ecx, &edx);
+	if (!(ecx & BIT(13)))		/* CPUID.1:ECX.CX16 */
+		panic("PVM guest requires CMPXCHG16B");
+
+	setup_force_cpu_cap(X86_FEATURE_KVM_PVM_GUEST);
+	setup_force_cpu_cap(X86_FEATURE_PV_GUEST);
+
+	/* Don't use SYSENTER (Intel) and SYSCALL32 (AMD) in vdso. */
+	setup_clear_cpu_cap(X86_FEATURE_SYSFAST32);
+	setup_clear_cpu_cap(X86_FEATURE_SYSCALL32);
+
+	/*
+	 * The user GSBASE is PVCS::user_gsbase, which the hypervisor loads on
+	 * the return to user mode.
+	 */
+	pv_ops.cpu.load_gs_index = pvm_load_gs_index;
+	pv_ops.cpu.cpuid = pvm_cpuid;
+
+	pv_ops.cpu.read_msr = pvm_read_msr;
+	pv_ops.cpu.write_msr = pvm_write_msr;
+	pv_ops.cpu.read_msr_safe = pvm_read_msr_safe;
+	pv_ops.cpu.write_msr_safe = pvm_write_msr_safe;
+	pv_ops.cpu.load_tls = pvm_load_tls;
+
+	this_cpu_write(pvm_guest_cr3, __native_read_cr3());
+	pv_ops.mmu.read_cr3 = pvm_read_cr3;
+	pv_ops.mmu.write_cr3 = pvm_write_cr3;
+	pv_ops.mmu.flush_tlb_user = pvm_flush_tlb_user;
+	pv_ops.mmu.flush_tlb_kernel = pvm_flush_tlb_kernel;
+	pv_ops.mmu.flush_tlb_one_user = pvm_flush_tlb_one_user;
+}
 
 #ifndef CONFIG_RANDOMIZE_MEMORY
 /* DIRECT_MAP_PHYSMEM_END in a PVM_GUEST kernel; kaslr.c defines it otherwise. */

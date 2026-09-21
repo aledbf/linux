@@ -21,6 +21,7 @@
 extern bool pvm_detected;
 
 void __init pvm_relocate_kernel(unsigned long physbase);
+void __init pvm_early_setup(void);
 bool __init pvm_kernel_layout_relocate(void);
 
 /* The page tables the PVH entry point runs on, from platform/pvh/head.S. */
@@ -99,11 +100,18 @@ static inline bool pvm_detect(void)
 	return eax == PVM_ABI_VERSION;
 }
 #else
+static inline void pvm_early_setup(void)
+{
+}
+
 static inline bool pvm_kernel_layout_relocate(void)
 {
 	return false;
 }
 #endif /* CONFIG_PVM_GUEST */
+
+/* Entry points and paravirt ops in entry_64_pvm.S */
+void pvm_hypercall(void);
 #endif /* !__ASSEMBLER__ */
 
 #endif /* _ASM_X86_PVM_PARA_H */

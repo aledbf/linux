@@ -26,3 +26,5 @@ CFLAGS_REMOVE_sysvec.o		+= -pg $(CC_FLAGS_FTRACE)
 obj-$(CONFIG_X86_FRED)		+= entry_64_fred.o entry_fred.o sysvec.o
 
 obj-$(CONFIG_IA32_EMULATION)	+= entry_64_compat.o syscall_32.o
+
+obj-$(CONFIG_PVM_GUEST)		+= entry_64_pvm.o

@@ -18,12 +18,22 @@ static inline bool kvm_check_and_clear_guest_paused(void)
 }
 #endif /* CONFIG_KVM_GUEST */
 
+#ifdef CONFIG_PVM_GUEST
+#define KVM_HYPERCALL \
+	ALTERNATIVE_2("vmcall", "vmmcall", X86_FEATURE_VMMCALL, \
+		      "call pvm_hypercall", X86_FEATURE_KVM_PVM_GUEST)
+#define KVM_HYPERCALL_OUTPUT(...)	ASM_CALL_CONSTRAINT, __VA_ARGS__
+#else
 #define KVM_HYPERCALL \
         ALTERNATIVE("vmcall", "vmmcall", X86_FEATURE_VMMCALL)
+#define KVM_HYPERCALL_OUTPUT(...)	__VA_ARGS__
+#endif /* CONFIG_PVM_GUEST */
 
 /* For KVM hypercalls, a three-byte sequence of either the vmcall or the vmmcall
- * instruction.  The hypervisor may replace it with something else but only the
- * instructions are guaranteed to be supported.
+ * instruction, or in a PVM guest a call to pvm_hypercall, which needs the stack
+ * pointer constraint that KVM_HYPERCALL_OUTPUT() adds.  The hypervisor may
+ * replace it with something else but only the instructions are guaranteed to
+ * be supported.
  *
  * Up to four arguments may be passed in rbx, rcx, rdx, and rsi respectively.
  * The hypercall number should be placed in rax and the return value will be
@@ -39,7 +49,7 @@ static inline long kvm_hypercall0(unsigned int nr)
 		return tdx_kvm_hypercall(nr, 0, 0, 0, 0);
 
 	asm volatile(KVM_HYPERCALL
-		     : "=a"(ret)
+		     : KVM_HYPERCALL_OUTPUT("=a"(ret))
 		     : "a"(nr)
 		     : "memory");
 	return ret;
@@ -53,7 +63,7 @@ static inline long kvm_hypercall1(unsigned int nr, unsigned long p1)
 		return tdx_kvm_hypercall(nr, p1, 0, 0, 0);
 
 	asm volatile(KVM_HYPERCALL
-		     : "=a"(ret)
+		     : KVM_HYPERCALL_OUTPUT("=a"(ret))
 		     : "a"(nr), "b"(p1)
 		     : "memory");
 	return ret;
@@ -68,7 +78,7 @@ static inline long kvm_hypercall2(unsigned int nr, unsigned long p1,
 		return tdx_kvm_hypercall(nr, p1, p2, 0, 0);
 
 	asm volatile(KVM_HYPERCALL
-		     : "=a"(ret)
+		     : KVM_HYPERCALL_OUTPUT("=a"(ret))
 		     : "a"(nr), "b"(p1), "c"(p2)
 		     : "memory");
 	return ret;
@@ -83,7 +93,7 @@ static inline long kvm_hypercall3(unsigned int nr, unsigned long p1,
 		return tdx_kvm_hypercall(nr, p1, p2, p3, 0);
 
 	asm volatile(KVM_HYPERCALL
-		     : "=a"(ret)
+		     : KVM_HYPERCALL_OUTPUT("=a"(ret))
 		     : "a"(nr), "b"(p1), "c"(p2), "d"(p3)
 		     : "memory");
 	return ret;
@@ -99,7 +109,7 @@ static inline long kvm_hypercall4(unsigned int nr, unsigned long p1,
 		return tdx_kvm_hypercall(nr, p1, p2, p3, p4);
 
 	asm volatile(KVM_HYPERCALL
-		     : "=a"(ret)
+		     : KVM_HYPERCALL_OUTPUT("=a"(ret))
 		     : "a"(nr), "b"(p1), "c"(p2), "d"(p3), "S"(p4)
 		     : "memory");
 	return ret;

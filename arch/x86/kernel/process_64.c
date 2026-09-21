@@ -160,7 +160,7 @@ enum which_selector {
  * traced or probed than any access to a per CPU variable happens with
  * the wrong GS.
  *
- * It is not used on Xen paravirt. When paravirt support is needed, it
+ * It is not used on Xen PV or PVM. When paravirt support is needed, it
  * needs to be renamed with native_ prefix.
  */
 static noinstr unsigned long __rdgsbase_inactive(void)
@@ -209,7 +209,7 @@ static noinstr unsigned long __rdgsbase_inactive(void)
  * traced or probed than any access to a per CPU variable happens with
  * the wrong GS.
  *
- * It is not used on Xen paravirt. When paravirt support is needed, it
+ * It is not used on Xen PV or PVM. When paravirt support is needed, it
  * needs to be renamed with native_ prefix.
  */
 static noinstr void __wrgsbase_inactive(unsigned long gsbase)
