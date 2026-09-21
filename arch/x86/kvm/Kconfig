@@ -170,6 +170,23 @@ config KVM_AMD_SEV
 	  Encrypted State (SEV-ES), and Secure Encrypted Virtualization with
 	  Secure Nested Paging (SEV-SNP) technologies on AMD processors.
 
+config KVM_PVM
+	tristate "Pagetable-based PV Virtual Machine"
+	depends on KVM && X86_64
+	select X86_PVM_SWITCHER
+	help
+	  Provides Pagetable-based PV Virtual Machine for KVM.  The guest runs
+	  at hardware CPL3 and is isolated with shadow paging rather than with
+	  VMX/SVM, which allows KVM to run on hosts that do not expose
+	  hardware virtualization support.
+
+	  The host kernel must be booted with pvm_host, which patches the
+	  switcher's hooks into the entry code; see
+	  Documentation/admin-guide/kernel-parameters.txt.
+
+	  To compile this as a module, choose M here: the module
+	  will be called kvm-pvm.
+
 config KVM_IOAPIC
 	bool "I/O APIC, PIC, and PIT emulation"
 	default y

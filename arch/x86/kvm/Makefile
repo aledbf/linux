@@ -23,6 +23,8 @@ kvm-intel-$(CONFIG_KVM_INTEL_TDX)	+= vmx/tdx.o
 
 kvm-amd-y		+= svm/svm.o svm/vmenter.o svm/pmu.o svm/nested.o svm/avic.o
 
+kvm-pvm-y		+= pvm/pvm.o pvm/host_mmu.o
+
 kvm-amd-$(CONFIG_KVM_AMD_SEV)	+= svm/sev.o
 kvm-amd-$(CONFIG_KVM_HYPERV)	+= svm/hyperv.o
 
@@ -35,6 +37,7 @@ endif
 obj-$(CONFIG_KVM_X86)	+= kvm.o
 obj-$(CONFIG_KVM_INTEL)	+= kvm-intel.o
 obj-$(CONFIG_KVM_AMD)	+= kvm-amd.o
+obj-$(CONFIG_KVM_PVM)	+= kvm-pvm.o
 
 AFLAGS_svm/vmenter.o    := -iquote $(obj)
 $(obj)/svm/vmenter.o: $(obj)/kvm-asm-offsets.h
