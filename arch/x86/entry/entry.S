@@ -76,7 +76,7 @@ THUNK warn_thunk_thunk, __warn_thunk
 EXPORT_SYMBOL(__ref_stack_chk_guard);
 #endif
 
-#if IS_ENABLED(CONFIG_KVM_INTEL)
+#if IS_ENABLED(CONFIG_KVM_INTEL) || IS_ENABLED(CONFIG_KVM_PVM)
 .macro IDT_DO_EVENT_IRQOFF call_insn call_target
 	/*
 	 * Unconditionally create a stack frame, getting the correct RSP on the
