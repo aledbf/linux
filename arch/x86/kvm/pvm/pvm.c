@@ -48,6 +48,9 @@ static __always_inline void pvm_load_ldt(u16 sel)
 	asm volatile("lldt %0" : : "rm" (sel));
 }
 
+static void pvm_unpin_vcpu_struct(struct vcpu_pvm *pvm);
+static int pvm_pin_vcpu_struct(struct vcpu_pvm *pvm, gpa_t gpa);
+
 static inline bool is_smod(struct vcpu_pvm *pvm)
 {
 	unsigned long switch_flags = pvm->switch_flags;
@@ -108,6 +111,16 @@ static inline void __load_fs_base(struct vcpu_pvm *pvm)
 	wrmsrq(MSR_FS_BASE, pvm->segments[VCPU_SREG_FS].base);
 }
 
+static u64 pvm_read_guest_gs_base(struct vcpu_pvm *pvm)
+{
+	preempt_disable();
+	if (pvm->loaded_cpu_state)
+		__save_gs_base(pvm);
+	preempt_enable();
+
+	return pvm->segments[VCPU_SREG_GS].base;
+}
+
 /*
  * The GS base the guest runs with is written to the hardware, which faults on
  * a non-canonical value.  Some of the values come straight from the guest --
@@ -124,6 +137,19 @@ static void pvm_write_guest_gs_base(struct vcpu_pvm *pvm, u64 data)
 	if (pvm->loaded_cpu_state)
 		__load_gs_base(pvm);
 	preempt_enable();
+}
+
+/*
+ * Whether the guest has turned protection keys on.  The guest runs at CPL3 on
+ * the host's own CR4.PKE, so the hardware applies PKRU whatever the guest was
+ * told; this is about whether the guest's *architectural* keys are in play,
+ * which is what decides who owns PKRU while the guest runs.
+ */
+static inline bool pvm_guest_uses_pku(struct kvm_vcpu *vcpu)
+{
+	return cpu_feature_enabled(X86_FEATURE_PKU) &&
+	       ((vcpu->arch.xcr0 & XFEATURE_MASK_PKRU) ||
+		kvm_is_cr4_bit_set(vcpu, X86_CR4_PKE));
 }
 
 /*
@@ -779,6 +805,299 @@ static void pvm_set_gdt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
 	to_pvm(vcpu)->gdt_ptr = *dt;
 }
 
+static void pvm_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
+				  int trig_mode, int vector)
+{
+	struct kvm_vcpu *vcpu = apic->vcpu;
+
+	kvm_lapic_set_irr(vector, apic);
+	kvm_make_request(KVM_REQ_EVENT, vcpu);
+	kvm_vcpu_kick(vcpu);
+}
+
+static void pvm_refresh_apicv_exec_ctrl(struct kvm_vcpu *vcpu)
+{
+}
+
+static bool pvm_apic_init_signal_blocked(struct kvm_vcpu *vcpu)
+{
+	return false;
+}
+
+static void pvm_unpin_vcpu_struct(struct vcpu_pvm *pvm)
+{
+	if (!pvm->pvcs_page)
+		return;
+
+	unpin_user_page(pvm->pvcs_page);
+	pvm->pvcs_page = NULL;
+	pvm->pvcs = NULL;
+}
+
+/*
+ * Pin the guest page backing @gpa and keep a kernel mapping of the PVCS.
+ *
+ * A long term pin is what makes the switcher's unchecked use of tss_ex.pvcs
+ * safe: it stops the page from being migrated, reclaimed or freed while the
+ * vCPU is in guest mode.  One page per vCPU is pinned, and only while the
+ * guest asks for it.
+ *
+ * The pin holds the page, not the VMM's mapping of the GFN.  A memslot change
+ * re-resolves it (pvm_reload_pinned_pages()), but a change of the mapping
+ * inside an unchanged memslot -- MADV_DONTNEED, hole punching, mmap over it --
+ * is not seen: the shadow MMU follows the new page while pvm->pvcs stays on
+ * the old one, and the guest and the hypervisor no longer share a PVCS.  The
+ * old page stays valid, so this cannot hurt the host, but the guest breaks.  A
+ * VMM must leave the PVCS page mapped while the guest has it registered, as it
+ * must for any other guest memory that is pinned.
+ */
+static int pvm_pin_vcpu_struct(struct vcpu_pvm *pvm, gpa_t gpa)
+{
+	struct kvm_vcpu *vcpu = &pvm->vcpu;
+	gfn_t gfn = gpa_to_gfn(gpa);
+	struct kvm_memory_slot *slot;
+	struct page *page;
+	unsigned long hva;
+	void *kaddr;
+
+	pvm_unpin_vcpu_struct(pvm);
+
+	/* The guest and the switcher write it. */
+	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
+	if (!slot || (slot->flags & KVM_MEM_READONLY))
+		return -EFAULT;
+
+	hva = kvm_vcpu_gfn_to_hva(vcpu, gfn);
+	if (kvm_is_error_hva(hva))
+		return -EFAULT;
+
+	if (pin_user_pages_fast(hva, 1, FOLL_WRITE | FOLL_LONGTERM, &page) != 1)
+		return -EFAULT;
+
+	/*
+	 * The switcher reads the PVCS through the direct map while the guest's
+	 * root is loaded, and that root only has the top-level entries the
+	 * host had when the module was loaded (see host_mmu_init()).
+	 */
+	kaddr = page_address(page);
+	if (!host_mmu_root_pgd[pgd_index((unsigned long)kaddr)]) {
+		unpin_user_page(page);
+		return -EFAULT;
+	}
+
+	pvm->pvcs_page = page;
+	pvm->pvcs_gfn = gfn;
+	pvm->pvcs = kaddr + offset_in_page(gpa);
+
+	return 0;
+}
+
+/*
+ * The guest writes the PVCS whenever it runs and the hypervisor writes it when
+ * it delivers an event, so it is marked dirty after every exit and after every
+ * hypervisor write.  Not every writer holds kvm->srcu -- KVM_SET_REGS reaches
+ * pvm_set_rflags() without it -- so take it here.
+ */
+static void pvm_mark_pvcs_dirty(struct vcpu_pvm *pvm)
+{
+	struct kvm *kvm = pvm->vcpu.kvm;
+	int idx;
+
+	idx = srcu_read_lock(&kvm->srcu);
+	kvm_vcpu_mark_page_dirty(&pvm->vcpu, pvm->pvcs_gfn);
+	srcu_read_unlock(&kvm->srcu, idx);
+}
+
+/*
+ * A long term pin keeps the PVCS page alive, but not the mapping current, so a
+ * memslot that moves or goes away leaves pvm->pvcs pointing at the right page
+ * for the wrong GPA.  Pin it again before the next entry.
+ */
+static void pvm_reload_pinned_pages(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	if (!pvm->msr_vcpu_struct)
+		return;
+
+	if (pvm_pin_vcpu_struct(pvm, pvm->msr_vcpu_struct))
+		kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+}
+
+static void pvm_event_flags_update(struct kvm_vcpu *vcpu, unsigned long set,
+				   unsigned long clear)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	struct pvm_vcpu_struct *pvcs = pvm->pvcs;
+	unsigned long old_flags, new_flags;
+
+	if (!pvcs)
+		return;
+
+	old_flags = pvcs->event_flags;
+	new_flags = (old_flags | set) & ~clear;
+	if (new_flags != old_flags) {
+		pvcs->event_flags = new_flags;
+		pvm_mark_pvcs_dirty(pvm);
+	}
+}
+
+/* Deliver an event to the guest through the PVCS, as the PVM spec describes. */
+static void __do_pvm_event(struct kvm_vcpu *vcpu, bool user, int vector,
+			   bool has_err_code, u64 err_code)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	struct pvm_vcpu_struct *pvcs = pvm->pvcs;
+	unsigned long entry;
+
+	if (!pvcs) {
+		vcpu_unimpl(vcpu, "no PVCS to deliver vector %d (MSR_PVM_VCPU_STRUCT=%#lx)\n",
+			    vector, pvm->msr_vcpu_struct);
+		kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+		return;
+	}
+
+	if (user) {
+		pvcs->user_cs = pvm->hw_cs;
+		pvcs->user_ss = pvm->hw_ss;
+		/*
+		 * The switcher's half of this is SWITCHER_PKRU_TO_SMOD.  Here
+		 * the hardware PKRU is the host's again, so the guest's user
+		 * value comes from where the core parked it on the way out.
+		 */
+		pvcs->pkru = pvm_guest_uses_pku(vcpu) ? vcpu->arch.pkru : 0;
+		pvcs->user_gsbase = pvm_read_guest_gs_base(pvm);
+	} else if (unlikely(pvcs->event_vector & 0xFF00)) {
+		/*
+		 * When the guest is busy on handling events, no nested
+		 * events are allowed except for the async exceptions.
+		 *
+		 * Set PVM_PVCS_EVENT_VECTOR_NMI or PVM_PVCS_EVENT_VECTOR_MCE
+		 * correspondingly.
+		 *
+		 * The guest should check async exceptions when it clears any
+		 * PVM_PVCS_EVENT_VECTOR_* bits.
+		 *
+		 * The guest should set PVM_PVCS_EVENT_VECTOR_STD before
+		 * invoking ERETU, and the hypervisor check for any unhandled
+		 * async exceptions when handling ERETU.
+		 */
+		if (vector == NMI_VECTOR) {
+			pvcs->event_vector |= PVM_PVCS_EVENT_VECTOR_NMI;
+		} else if (vector == MC_VECTOR) {
+			pvcs->event_vector |= PVM_PVCS_EVENT_VECTOR_MCE;
+		} else {
+			vcpu_unimpl(vcpu, "vector %d nested in event_vector %#x\n",
+				    vector, pvcs->event_vector);
+			kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+		}
+
+		/*
+		 * Reuse SWITCH_FLAGS_IRQ_WIN to force the guest ERETU back to
+		 * the hypervisor to meet the requirement stipulated above in
+		 * case it is on the path to ERETU.
+		 *
+		 * When forced back to handle_synthetic_instruction_return_user(),
+		 * SWITCH_FLAGS_IRQ_WIN will be cleared in kvm_set_rflags() or
+		 * unhandled NMI/MCE will be reinjected.
+		 */
+		pvm->switch_flags |= SWITCH_FLAGS_IRQ_WIN;
+		pvm_mark_pvcs_dirty(pvm);
+		return;
+	}
+
+	pvcs->eflags = kvm_get_rflags(vcpu);
+	pvcs->rip = kvm_rip_read(vcpu);
+	pvcs->rcx = kvm_rcx_read(vcpu);
+	pvcs->r11 = kvm_r11_read(vcpu);
+
+	if (has_err_code)
+		pvcs->event_errcode = err_code;
+
+	if (vector == NMI_VECTOR)
+		pvcs->event_vector = PVM_PVCS_EVENT_VECTOR_NMI;
+	else if (vector == MC_VECTOR)
+		pvcs->event_vector = PVM_PVCS_EVENT_VECTOR_MCE;
+	else if (vector != PVM_SYSCALL_VECTOR)
+		pvcs->event_vector = PVM_PVCS_EVENT_VECTOR_STD | vector;
+
+	/* A #PF's CR2 reaches PVCS::cr2 on entry, see pvm_vcpu_run(). */
+
+	pvm_mark_pvcs_dirty(pvm);
+
+	if (user)
+		switch_to_smod(vcpu);
+
+	if (vector == PVM_SYSCALL_VECTOR)
+		entry = pvm->msr_lstar;
+	else if (user)
+		entry = pvm->msr_event_entry;
+	else
+		entry = pvm->msr_event_entry + PVM_EVENT_ENTRY_SUPERVISOR_OFFSET;
+
+	/*
+	 * RCX and R11 hold the entry RIP and RFLAGS, as SYSRET needs them, so
+	 * that the switcher can enter the guest with SYSRET.
+	 */
+	kvm_rip_write(vcpu, entry);
+	kvm_rcx_write_raw(vcpu, entry);
+	kvm_set_rflags(vcpu, X86_EFLAGS_FIXED);
+	kvm_r11_write_raw(vcpu, X86_EFLAGS_IF | X86_EFLAGS_FIXED);
+}
+
+static void do_pvm_event(struct kvm_vcpu *vcpu, int vector,
+			 bool has_error_code, u64 error_code)
+{
+	/*
+	 * Unlike in VMX, the injected event is delivered by the guest before
+	 * VM entry, so it is not allowed to inject event in non-PVM mode.
+	 * The hypervisor attempts to switch to PVM mode before event
+	 * injection, but the VMM may still inject an event in non-PVM mode, so
+	 * say so and try to switch to PVM mode here.
+	 */
+	if (unlikely(to_pvm(vcpu)->non_pvm_mode)) {
+		vcpu_unimpl(vcpu, "event injected in non-PVM mode\n");
+		try_to_convert_to_pvm_mode(vcpu);
+	}
+
+	__do_pvm_event(vcpu, !is_smod(to_pvm(vcpu)), vector, has_error_code, error_code);
+}
+
+static unsigned long pvm_get_rflags(struct kvm_vcpu *vcpu)
+{
+	return to_pvm(vcpu)->rflags;
+}
+
+static void pvm_set_rflags(struct kvm_vcpu *vcpu, unsigned long rflags)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	int need_update = !!((pvm->rflags ^ rflags) & X86_EFLAGS_IF);
+
+	pvm->rflags = rflags;
+
+	if (rflags & X86_EFLAGS_IF)
+		pvm->switch_flags &= ~SWITCH_FLAGS_IRQ_WIN;
+
+	/*
+	 * The IF bit of 'pvcs->event_flags' should not be changed in user
+	 * mode. It is recommended for this bit to be cleared when switching to
+	 * user mode, so that when the guest switches back to supervisor mode,
+	 * the X86_EFLAGS_IF is already cleared.
+	 */
+	if (unlikely(pvm->non_pvm_mode) || !need_update || !is_smod(pvm))
+		return;
+
+	if (rflags & X86_EFLAGS_IF)
+		pvm_event_flags_update(vcpu, PVM_EVENT_FLAGS_IF, PVM_EVENT_FLAGS_IP);
+	else
+		pvm_event_flags_update(vcpu, 0, PVM_EVENT_FLAGS_IF);
+}
+
+static bool pvm_get_if_flag(struct kvm_vcpu *vcpu)
+{
+	return pvm_get_rflags(vcpu) & X86_EFLAGS_IF;
+}
+
 static u32 pvm_get_interrupt_shadow(struct kvm_vcpu *vcpu)
 {
 	return to_pvm(vcpu)->int_shadow;
@@ -791,6 +1110,130 @@ static void pvm_set_interrupt_shadow(struct kvm_vcpu *vcpu, int mask)
 	/* PVM spec: ignore interrupt shadow when in PVM mode. */
 	if (pvm->non_pvm_mode)
 		pvm->int_shadow = mask;
+}
+
+static void pvm_enable_irq_window(struct kvm_vcpu *vcpu)
+{
+	to_pvm(vcpu)->switch_flags |= SWITCH_FLAGS_IRQ_WIN;
+	pvm_event_flags_update(vcpu, PVM_EVENT_FLAGS_IP, 0);
+}
+
+static int pvm_interrupt_allowed(struct kvm_vcpu *vcpu, bool for_injection)
+{
+	/*
+	 * In the non-PVM bootstrap mode the only way to deliver an interrupt
+	 * is through the real-mode IVT, emulated below.  Protected mode has
+	 * no PVCS yet and no IDT the hypervisor knows how to use, so say no
+	 * and let the core hold the interrupt pending until the guest has
+	 * reached PVM mode.
+	 */
+	if (unlikely(to_pvm(vcpu)->non_pvm_mode) && is_protmode(vcpu))
+		return 0;
+
+	return pvm_get_if_flag(vcpu) && !pvm_get_interrupt_shadow(vcpu);
+}
+
+static bool pvm_get_nmi_mask(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	return pvm->non_pvm_mode ? pvm->nmi_mask : !pvm->msr_vcpu_struct;
+}
+
+static void pvm_set_nmi_mask(struct kvm_vcpu *vcpu, bool masked)
+{
+	to_pvm(vcpu)->nmi_mask = masked;
+}
+
+/*
+ * Nothing to do.  In non-PVM mode the vCPU is being emulated.  With a PVCS
+ * NMIs are never masked; without one they are, and writing
+ * MSR_PVM_VCPU_STRUCT raises KVM_REQ_EVENT, which looks at pending NMIs.
+ */
+static void pvm_enable_nmi_window(struct kvm_vcpu *vcpu)
+{
+}
+
+static int pvm_nmi_allowed(struct kvm_vcpu *vcpu, bool for_injection)
+{
+	return !pvm_get_nmi_mask(vcpu) && !pvm_get_interrupt_shadow(vcpu);
+}
+
+/*
+ * Non-PVM mode has no PVCS, so do_pvm_event() has nowhere to deliver an event.
+ * In real mode, deliver it through the IVT with the emulator, as VMX does for
+ * a guest it cannot run unrestricted.
+ */
+static bool pvm_inject_realmode_event(struct kvm_vcpu *vcpu, int vector,
+				      bool soft)
+{
+	int inc_eip = 0;
+
+	if (likely(!to_pvm(vcpu)->non_pvm_mode))
+		return false;
+
+	if (WARN_ON_ONCE(is_protmode(vcpu)))
+		return false;
+
+	if (soft)
+		inc_eip = vcpu->arch.event_exit_inst_len;
+	kvm_inject_realmode_interrupt(vcpu, vector, inc_eip);
+	return true;
+}
+
+/* Always inject the exception directly and consume the event. */
+static void pvm_inject_exception(struct kvm_vcpu *vcpu)
+{
+	unsigned int vector = vcpu->arch.exception.vector;
+	bool has_error_code = vcpu->arch.exception.has_error_code;
+	u32 error_code = vcpu->arch.exception.error_code;
+
+	kvm_deliver_exception_payload(vcpu, &vcpu->arch.exception);
+
+	if (pvm_inject_realmode_event(vcpu, vector,
+				      kvm_exception_is_soft(vector))) {
+		kvm_clear_exception_queue(vcpu);
+		return;
+	}
+
+	do_pvm_event(vcpu, vector, has_error_code, error_code);
+	kvm_clear_exception_queue(vcpu);
+}
+
+/* Always inject the interrupt directly and consume the event. */
+static void pvm_inject_irq(struct kvm_vcpu *vcpu, bool reinjected)
+{
+	int irq = vcpu->arch.interrupt.nr;
+
+	trace_kvm_inj_virq(irq, vcpu->arch.interrupt.soft, reinjected);
+
+	if (!pvm_inject_realmode_event(vcpu, irq, vcpu->arch.interrupt.soft))
+		do_pvm_event(vcpu, irq, false, 0);
+	kvm_clear_interrupt_queue(vcpu);
+
+	++vcpu->stat.irq_injections;
+}
+
+/* Always inject the NMI directly and consume the event. */
+static void pvm_inject_nmi(struct kvm_vcpu *vcpu)
+{
+	if (!pvm_inject_realmode_event(vcpu, NMI_VECTOR, false))
+		do_pvm_event(vcpu, NMI_VECTOR, false, 0);
+	vcpu->arch.nmi_injected = false;
+
+	++vcpu->stat.nmi_injections;
+}
+
+static void pvm_cancel_injection(struct kvm_vcpu *vcpu)
+{
+	/*
+	 * Nothing to do. Since exceptions/interrupts are delivered immediately
+	 * during event injection, so they cannot be cancelled and reinjected.
+	 */
+}
+
+static void pvm_setup_mce(struct kvm_vcpu *vcpu)
+{
 }
 
 static bool cpu_has_pvm_wbinvd_exit(void)
@@ -815,6 +1258,13 @@ static int pvm_vcpu_create(struct kvm_vcpu *vcpu)
 	pvm->switch_flags = SWITCH_FLAGS_INIT;
 
 	return 0;
+}
+
+static void pvm_vcpu_free(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	pvm_unpin_vcpu_struct(pvm);
 }
 
 /*
@@ -1129,6 +1579,18 @@ static void pvm_hv_inject_synthetic_vmexit_post_tlb_flush(struct kvm_vcpu *vcpu)
 }
 #endif
 
+/*
+ * No posted interrupts: kvm_arch_has_irq_bypass() is false without APICv,
+ * which PVM never enables, so nothing asks to post one.  Refuse if something
+ * does, rather than let KVM believe an interrupt is being delivered.
+ */
+static int pvm_pi_update_irte(struct kvm_kernel_irqfd *irqfd, struct kvm *kvm,
+			      unsigned int host_irq, uint32_t guest_irq,
+			      struct kvm_vcpu *vcpu, u32 vector)
+{
+	return vcpu ? -EINVAL : 0;
+}
+
 struct kvm_x86_nested_ops pvm_nested_ops = {
 	.leave_nested = pvm_leave_nested,
 	.is_exception_vmexit = pvm_is_exception_vmexit,
@@ -1159,6 +1621,7 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.vm_init = pvm_vm_init,
 
 	.vcpu_create = pvm_vcpu_create,
+	.vcpu_free = pvm_vcpu_free,
 
 	.prepare_switch_to_guest = pvm_prepare_switch_to_guest,
 	.vcpu_load = pvm_vcpu_load,
@@ -1182,6 +1645,9 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.get_idt = pvm_get_idt,
 	.set_idt = pvm_set_idt,
 	.cache_reg = pvm_cache_reg,
+	.get_rflags = pvm_get_rflags,
+	.set_rflags = pvm_set_rflags,
+	.get_if_flag = pvm_get_if_flag,
 
 	.flush_tlb_all = pvm_flush_hwtlb,
 	.flush_tlb_current = pvm_flush_hwtlb_current,
@@ -1190,6 +1656,22 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 
 	.set_interrupt_shadow = pvm_set_interrupt_shadow,
 	.get_interrupt_shadow = pvm_get_interrupt_shadow,
+	.inject_irq = pvm_inject_irq,
+	.inject_nmi = pvm_inject_nmi,
+	.inject_exception = pvm_inject_exception,
+	.cancel_injection = pvm_cancel_injection,
+	.interrupt_allowed = pvm_interrupt_allowed,
+	.nmi_allowed = pvm_nmi_allowed,
+	.get_nmi_mask = pvm_get_nmi_mask,
+	.set_nmi_mask = pvm_set_nmi_mask,
+	.enable_nmi_window = pvm_enable_nmi_window,
+	.enable_irq_window = pvm_enable_irq_window,
+	.refresh_apicv_exec_ctrl = pvm_refresh_apicv_exec_ctrl,
+	.deliver_interrupt = pvm_deliver_interrupt,
+
+	.pi_update_irte = pvm_pi_update_irte,
+
+	.setup_mce = pvm_setup_mce,
 
 #ifdef CONFIG_KVM_SMM
 	.smi_allowed = pvm_smi_allowed,
@@ -1198,7 +1680,11 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.enable_smi_window = pvm_enable_smi_window,
 #endif
 
+	.apic_init_signal_blocked = pvm_apic_init_signal_blocked,
+	.vcpu_deliver_sipi_vector = kvm_vcpu_deliver_sipi_vector,
+
 	.disallowed_va = pvm_disallowed_va,
+	.reload_pinned_pages = pvm_reload_pinned_pages,
 };
 
 static struct kvm_x86_init_ops pvm_init_ops __initdata = {
