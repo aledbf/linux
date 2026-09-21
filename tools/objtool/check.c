@@ -3425,7 +3425,7 @@ static inline bool func_uaccess_safe(struct symbol *func)
 
 static inline const char *call_dest_name(struct instruction *insn)
 {
-	static char pvname[19];
+	static char pvname[32];
 	struct reloc *reloc;
 	int idx;
 
@@ -3433,9 +3433,9 @@ static inline const char *call_dest_name(struct instruction *insn)
 		return insn_call_dest(insn)->name;
 
 	reloc = insn_reloc(NULL, insn);
-	if (reloc && !strcmp(reloc->sym->name, "pv_ops")) {
+	if (reloc && pv_ops_idx_off(reloc->sym->name) >= 0) {
 		idx = (reloc_addend(reloc) / sizeof(void *));
-		snprintf(pvname, sizeof(pvname), "pv_ops[%d]", idx);
+		snprintf(pvname, sizeof(pvname), "%s[%d]", reloc->sym->name, idx);
 		return pvname;
 	}
 
@@ -3446,13 +3446,17 @@ static bool pv_call_dest(struct objtool_file *file, struct instruction *insn)
 {
 	struct symbol *target;
 	struct reloc *reloc;
-	int idx;
+	int idx, idx_off;
 
 	reloc = insn_reloc(file, insn);
-	if (!reloc || strcmp(reloc->sym->name, "pv_ops"))
+	if (!reloc)
 		return false;
 
-	idx = arch_insn_adjusted_addend(insn, reloc) / sizeof(void *);
+	idx_off = pv_ops_idx_off(reloc->sym->name);
+	if (idx_off < 0)
+		return false;
+
+	idx = arch_insn_adjusted_addend(insn, reloc) / sizeof(void *) + idx_off;
 
 	if (file->pv_ops[idx].clean)
 		return true;
@@ -3461,7 +3465,8 @@ static bool pv_call_dest(struct objtool_file *file, struct instruction *insn)
 
 	list_for_each_entry(target, &file->pv_ops[idx].targets, pv_target) {
 		if (!target->sec->noinstr) {
-			WARN("pv_ops[%d]: %s", idx, target->name);
+			WARN("%s[%d]: %s", reloc->sym->name, idx - idx_off,
+			     target->name);
 			file->pv_ops[idx].clean = false;
 		}
 	}
