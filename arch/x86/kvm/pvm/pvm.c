@@ -427,6 +427,7 @@ static struct kvm_x86_init_ops pvm_init_ops __initdata = {
 	.hardware_setup = pvm_hardware_setup,
 
 	.runtime_ops = &pvm_x86_ops,
+	.pmu_ops = &pvm_pmu_ops,
 	.nested_ops = &pvm_nested_ops,
 };
 

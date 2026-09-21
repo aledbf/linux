@@ -23,7 +23,7 @@ kvm-intel-$(CONFIG_KVM_INTEL_TDX)	+= vmx/tdx.o
 
 kvm-amd-y		+= svm/svm.o svm/vmenter.o svm/pmu.o svm/nested.o svm/avic.o
 
-kvm-pvm-y		+= pvm/pvm.o pvm/host_mmu.o
+kvm-pvm-y		+= pvm/pvm.o pvm/pmu.o pvm/host_mmu.o
 
 kvm-amd-$(CONFIG_KVM_AMD_SEV)	+= svm/sev.o
 kvm-amd-$(CONFIG_KVM_HYPERV)	+= svm/hyperv.o

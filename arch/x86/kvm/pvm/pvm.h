@@ -172,4 +172,7 @@ static __always_inline struct vcpu_pvm *to_pvm(struct kvm_vcpu *vcpu)
 	return container_of(vcpu, struct vcpu_pvm, vcpu);
 }
 
+/* pmu.c */
+extern struct kvm_pmu_ops pvm_pmu_ops;
+
 #endif /* __KVM_X86_PVM_H */
