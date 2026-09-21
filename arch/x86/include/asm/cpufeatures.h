@@ -531,6 +531,7 @@
 						      * and purposes if CLEAR_CPU_BUF_VM is set).
 						      */
 #define X86_FEATURE_X2AVIC_EXT		(21*32+20) /* AMD SVM x2AVIC support for 4k vCPUs */
+#define X86_FEATURE_PVM_HOST		(21*32+21) /* Host entry code can run PVM guests */
 
 /*
  * BUG word(s)

@@ -5618,6 +5618,17 @@ Kernel parameters
 			Format: <bool>
 			Default: on
 
+	pvm_host	[X86-64,KVM,EARLY] Patch the PVM switcher's hooks
+			into the host entry code at boot, so that kvm-pvm
+			can run PVM guests.  The hooks add a per-CPU load
+			and a not-taken branch to exception, interrupt and
+			NMI entry, whether or not a guest runs; without
+			pvm_host they stay NOPs or a short jmp.  Ignored,
+			with a warning, on a host with KPTI or FRED, without
+			FSGSBASE, PCID or INVPCID, or in a Xen PV guest.
+			Format: <bool>
+			Default: off
+
 	quiet		[KNL,EARLY] Disable most log messages
 
 	r128=		[HW,DRM]

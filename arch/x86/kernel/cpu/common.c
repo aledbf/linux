@@ -2594,6 +2594,66 @@ void arch_smt_update(void)
 	apic_smt_update();
 }
 
+#ifdef CONFIG_X86_PVM_SWITCHER
+static bool pvm_host_requested __initdata;
+
+static int __init pvm_host_setup(char *arg)
+{
+	return kstrtobool(arg ?: "1", &pvm_host_requested);
+}
+early_param("pvm_host", pvm_host_setup);
+
+/*
+ * Set X86_FEATURE_PVM_HOST, which patches the PVM switcher's hooks into the
+ * host's IDT entry paths, when the administrator asked for it with pvm_host
+ * and the host can run the switcher.  Without it every hook keeps its
+ * unpatched form -- NOPs, or a short jmp over the hook in paranoid_entry and
+ * paranoid_exit -- and kvm-pvm refuses to load.
+ *
+ * The hooks are decided at boot because entry code cannot be repatched while
+ * CPUs run it: the int3 that live patching relies on would be taken inside
+ * error_entry, which the int3 handler itself goes through, and inside the NMI
+ * entry before the NMI frame is safe from a nested NMI.
+ *
+ * What the switcher needs: FSGSBASE, PCID with INVPCID, and the host kernel
+ * mapped in every page table, so no KPTI.  FRED replaces the IDT entry paths
+ * it hooks, and a Xen PV guest has entry paths of its own.  A PVM hypervisor
+ * tests this feature instead of repeating these checks, and adds requirements
+ * of its own.
+ *
+ * Must run before alternative_instructions().
+ */
+static void __init pvm_host_init(void)
+{
+	const char *why = NULL;
+
+	if (!pvm_host_requested)
+		return;
+
+	if (!boot_cpu_has(X86_FEATURE_FSGSBASE))
+		why = "FSGSBASE";
+	else if (!boot_cpu_has(X86_FEATURE_PCID) ||
+		 !boot_cpu_has(X86_FEATURE_INVPCID))
+		why = "PCID and INVPCID";
+	else if (boot_cpu_has(X86_FEATURE_PTI))
+		why = "a host without KPTI";
+	else if (cpu_feature_enabled(X86_FEATURE_FRED))
+		why = "IDT entry, not FRED";
+	else if (cpu_feature_enabled(X86_FEATURE_XENPV))
+		why = "native entry code, not Xen PV";
+
+	if (why) {
+		pr_warn("pvm_host: not enabled, the PVM switcher requires %s\n", why);
+		return;
+	}
+
+	setup_force_cpu_cap(X86_FEATURE_PVM_HOST);
+	pr_info("pvm_host: PVM switcher entry hooks enabled\n");
+}
+#else
+static inline void pvm_host_init(void) { }
+#endif
+
 void __init arch_cpu_finalize_init(void)
 {
 	struct cpuinfo_x86 *c = this_cpu_ptr(&cpu_info);
@@ -2641,6 +2701,8 @@ void __init arch_cpu_finalize_init(void)
 	 */
 	if (efi_enabled(EFI_RUNTIME_SERVICES))
 		efi_enter_virtual_mode();
+
+	pvm_host_init();
 
 	/*
 	 * Ensure that access to the per CPU representation has the initial
