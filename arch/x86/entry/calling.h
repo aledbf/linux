@@ -9,6 +9,7 @@
 #include <asm/ptrace-abi.h>
 #include <asm/msr.h>
 #include <asm/nospec-branch.h>
+#include <asm/pvm_switcher.h>
 
 /*
 
@@ -147,6 +148,56 @@ For 32-bit we have the following conventions - kernel is built with
 	popq %rdi
 	.endif
 .endm
+
+#ifdef CONFIG_X86_PVM_SWITCHER
+
+#define TSS_extra(field) PER_CPU_VAR(cpu_tss_rw+TSS_EX_##field)
+
+/*
+ * TSS_extra(host_rsp) is non-zero from switcher_enter_guest() until it returns
+ * to its caller, and CR3 may be the PVM guest's anywhere in that window.  The
+ * guest's page tables map the host kernel, but their lower half is the
+ * guest's rather than the interrupted task's, so an exception handler must
+ * not run on them.  Save CR3 in \save_reg and load the host's; \save_reg must
+ * be zero on entry and stays zero when nothing was switched.  Needs the
+ * kernel GSBASE.
+ */
+.macro SWITCHER_SAVE_AND_SWITCH_TO_HOST_CR3 scratch_reg:req save_reg:req
+	ALTERNATIVE "jmp .Lend_\@", "", X86_FEATURE_PVM_HOST
+	cmpq	$0, TSS_extra(host_rsp)
+	jz	.Lend_\@
+	movq	%cr3, \save_reg
+	movq	TSS_extra(host_cr3), \scratch_reg
+	movq	\scratch_reg, %cr3
+.Lend_\@:
+.endm
+
+/*
+ * Reload the CR3 saved by SWITCHER_SAVE_AND_SWITCH_TO_HOST_CR3, if any.
+ *
+ * Reloading it means a host handler ran inside the switcher window, and the
+ * switcher goes on to the guest without passing switcher_enter_guest again,
+ * so clear CPU buffers here, as switcher_enter_guest does.  Clobbers flags.
+ */
+.macro SWITCHER_RESTORE_CR3 save_reg:req
+	ALTERNATIVE "jmp .Lend_\@", "", X86_FEATURE_PVM_HOST
+	testq	\save_reg, \save_reg
+	jz	.Lend_\@
+	btsq	$X86_CR3_PCID_NOFLUSH_BIT, \save_reg
+	movq	\save_reg, %cr3
+	ALTERNATIVE "", __CLEAR_CPU_BUFFERS, X86_FEATURE_CLEAR_CPU_BUF_VM
+.Lend_\@:
+.endm
+
+#else /* !CONFIG_X86_PVM_SWITCHER */
+
+.macro SWITCHER_SAVE_AND_SWITCH_TO_HOST_CR3 scratch_reg:req save_reg:req
+.endm
+
+.macro SWITCHER_RESTORE_CR3 save_reg:req
+.endm
+
+#endif /* CONFIG_X86_PVM_SWITCHER */
 
 #ifdef CONFIG_MITIGATION_PAGE_TABLE_ISOLATION
 

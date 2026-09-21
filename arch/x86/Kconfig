@@ -847,6 +847,22 @@ config KVM_GUEST
 	  underlying device model, the host provides the guest with
 	  timing infrastructure such as time of day, and system time
 
+config X86_PVM_SWITCHER
+	bool
+	depends on X86_64
+	help
+	  The world switch between the host and a PVM guest, plus the host
+	  entry-path hooks that recognise an exception taken while a guest is
+	  running.  Selected by KVM_PVM; there is nothing to configure here.
+
+	  The hooks are patched into the entry code at boot only when the
+	  kernel is booted with pvm_host on a host that can run the switcher.
+	  They then cost a per-CPU load and a not-taken branch on every
+	  exception, interrupt and NMI, whether or not a guest runs.  In a
+	  kernel booted without pvm_host the hooks keep their unpatched form:
+	  NOPs, or a short jmp over the hook in the paranoid entry and exit
+	  paths.
+
 config PVM_GUEST
 	bool "PVM Guest support"
 	depends on X86_64 && KVM_GUEST && !KASAN && !KMSAN && !RUST

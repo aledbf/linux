@@ -5,6 +5,7 @@
 #include <asm/segment.h>
 #include <asm/page_types.h>
 #include <uapi/asm/ptrace.h>
+#include <asm/pvm_switcher.h>
 
 #ifndef __ASSEMBLER__
 #ifdef __i386__
@@ -271,6 +272,13 @@ static __always_inline bool ip_within_syscall_gap(struct pt_regs *regs)
 		      regs->ip <  (unsigned long)entry_SYSCALL_compat_safe_stack);
 	ret = ret || (regs->ip >= (unsigned long)entry_SYSRETL_compat_unsafe_stack &&
 		      regs->ip <  (unsigned long)entry_SYSRETL_compat_end);
+#endif
+#ifdef CONFIG_X86_PVM_SWITCHER
+	/* The switcher has the same window on the guest's behalf. */
+	ret = ret || (regs->ip >= (unsigned long)entry_SYSCALL_64_switcher &&
+		      regs->ip <  (unsigned long)entry_SYSCALL_64_switcher_safe_stack);
+
+	ret = ret || (regs->ip == (unsigned long)entry_SYSRETQ_switcher_unsafe_stack);
 #endif
 
 	return ret;

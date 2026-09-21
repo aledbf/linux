@@ -229,6 +229,16 @@ static void __init setup_cpu_entry_area(unsigned int cpu)
 	 */
 	BUILD_BUG_ON(offsetof(struct tss_struct, x86_tss) != 0);
 	BUILD_BUG_ON(sizeof(struct x86_hw_tss) != 0x68);
+#ifdef CONFIG_X86_PVM_SWITCHER
+	/*
+	 * The PVM switcher's struct tss_extra shares the TSS's first page with
+	 * the hardware TSS, and fits in room the page-aligned tss_struct
+	 * already has: it grows neither the TSS nor the cpu_entry_area.
+	 */
+	BUILD_BUG_ON(offsetofend(struct tss_struct, tss_ex) > PAGE_SIZE);
+	BUILD_BUG_ON(sizeof(struct tss_struct) !=
+		     PAGE_ALIGN(sizeof(struct x86_hw_tss) + sizeof(struct x86_io_bitmap)));
+#endif
 
 	cea_map_percpu_pages(&cea->tss, &per_cpu(cpu_tss_rw, cpu),
 			     sizeof(struct tss_struct) / PAGE_SIZE, tss_prot);

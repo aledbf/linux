@@ -5,7 +5,7 @@
 
 #include <asm/ia32.h>
 
-#ifdef CONFIG_PVM_GUEST
+#if defined(CONFIG_X86_PVM_SWITCHER) || defined(CONFIG_PVM_GUEST)
 #include <asm/pvm_para.h>
 #endif
 
@@ -58,7 +58,25 @@ int main(void)
 	BLANK();
 #undef ENTRY
 
-#ifdef CONFIG_PVM_GUEST
+#ifdef CONFIG_X86_PVM_SWITCHER
+#define ENTRY(entry) OFFSET(TSS_EX_ ## entry, tss_struct, tss_ex.entry)
+	ENTRY(host_cr3);
+	ENTRY(host_rsp);
+	ENTRY(enter_cr3);
+	ENTRY(switch_flags);
+	ENTRY(smod_cr3);
+	ENTRY(umod_cr3);
+	ENTRY(pvcs);
+	ENTRY(retu_rip);
+	ENTRY(smod_entry);
+	ENTRY(smod_gsbase);
+	ENTRY(pku_on);
+	ENTRY(smod_pkru);
+	BLANK();
+#undef ENTRY
+#endif
+
+#if defined(CONFIG_X86_PVM_SWITCHER) || defined(CONFIG_PVM_GUEST)
 #define ENTRY(entry) OFFSET(PVCS_ ## entry, pvm_vcpu_struct, entry)
 	ENTRY(event_flags);
 	ENTRY(cr2);
@@ -71,6 +89,7 @@ int main(void)
 	ENTRY(rip);
 	ENTRY(rcx);
 	ENTRY(r11);
+	ENTRY(pkru);
 	BLANK();
 #undef ENTRY
 

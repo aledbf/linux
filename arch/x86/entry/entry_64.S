@@ -286,7 +286,7 @@ SYM_CODE_END(xen_error_entry)
  * @cfunc:		C function to be called
  * @has_error_code:	Hardware pushed error code on stack
  */
-.macro idtentry_body cfunc has_error_code:req
+.macro idtentry_body vector cfunc has_error_code:req
 
 	/*
 	 * Call error_entry() and switch to the task stack if from userspace.
@@ -302,6 +302,16 @@ SYM_CODE_END(xen_error_entry)
 	ENCODE_FRAME_POINTER
 	UNWIND_HINT_REGS
 
+#ifdef CONFIG_X86_PVM_SWITCHER
+	/*
+	 * A non-zero %r14 from error_entry means the PVM switcher was active:
+	 * either the event came from the guest, or CR3 must be restored after
+	 * the handler.
+	 */
+	ALTERNATIVE "", "testq %r14, %r14; jnz .Lswitcher_active_\@", X86_FEATURE_PVM_HOST
+.Lhost_event_\@:
+#endif
+
 	movq	%rsp, %rdi			/* pt_regs pointer into 1st argument*/
 
 	.if \has_error_code == 1
@@ -313,7 +323,36 @@ SYM_CODE_END(xen_error_entry)
 	ANNOTATE_REACHABLE
 	call	\cfunc
 
+#ifdef CONFIG_X86_PVM_SWITCHER
+	ALTERNATIVE "", "testq %r14, %r14; jnz .Lswitcher_restore_cr3_\@", X86_FEATURE_PVM_HOST
+#endif
 	jmp	error_return
+
+#ifdef CONFIG_X86_PVM_SWITCHER
+.Lswitcher_active_\@:
+	/* A kernel-mode event is the host's own; %r14 holds its CR3. */
+	testb	$3, CS(%rsp)
+	jz	.Lhost_event_\@
+
+	/* An event from the guest: hand its registers to the switcher. */
+	.if \vector < 256
+	movl	$\vector, ORIG_RAX_VECTOR(%rsp)
+	.else
+	/*
+	 * common_interrupt() and spurious_interrupt() are entered with the
+	 * vector X86_TRAP_OTHER; the real one is the byte their stubs pushed
+	 * into ORIG_RAX, sign-extended.
+	 */
+	movzbl	ORIG_RAX(%rsp), %eax
+	movl	%eax, ORIG_RAX_VECTOR(%rsp)
+	movl	$-1, ORIG_RAX(%rsp)
+	.endif
+	jmp	switcher_return_from_guest
+
+.Lswitcher_restore_cr3_\@:
+	SWITCHER_RESTORE_CR3 save_reg=%r14
+	jmp	error_return
+#endif /* CONFIG_X86_PVM_SWITCHER */
 .endm
 
 /**
@@ -358,7 +397,7 @@ SYM_CODE_START(\asmsym)
 .Lfrom_usermode_no_gap_\@:
 	.endif
 
-	idtentry_body \cfunc \has_error_code
+	idtentry_body \vector \cfunc \has_error_code
 
 _ASM_NOKPROBE(\asmsym)
 SYM_CODE_END(\asmsym)
@@ -423,7 +462,7 @@ SYM_CODE_START(\asmsym)
 
 	/* Switch to the regular task stack and use the noist entry point */
 .Lfrom_usermode_switch_stack_\@:
-	idtentry_body noist_\cfunc, has_error_code=0
+	idtentry_body \vector, noist_\cfunc, has_error_code=0
 
 _ASM_NOKPROBE(\asmsym)
 SYM_CODE_END(\asmsym)
@@ -503,7 +542,7 @@ SYM_CODE_START(\asmsym)
 
 	/* Switch to the regular task stack */
 .Lfrom_usermode_switch_stack_\@:
-	idtentry_body \cfunc, has_error_code=1
+	idtentry_body \vector, \cfunc, has_error_code=1
 
 _ASM_NOKPROBE(\asmsym)
 SYM_CODE_END(\asmsym)
@@ -933,6 +972,9 @@ SYM_CODE_START(paranoid_entry)
 	FENCE_SWAPGS_KERNEL_ENTRY
 .Lparanoid_gsbase_done:
 
+	/* The PVM switcher may have the guest's CR3 loaded; needs GSBASE. */
+	SWITCHER_SAVE_AND_SWITCH_TO_HOST_CR3 scratch_reg=%rax save_reg=%r14
+
 	/*
 	 * Once we have CR3 and %GS setup save and set SPEC_CTRL. Just like
 	 * CR3 above, keep the old value in a callee saved register.
@@ -986,6 +1028,8 @@ SYM_CODE_START_LOCAL(paranoid_exit)
 	 */
 	PARANOID_RESTORE_CR3 scratch_reg=%rax save_reg=%r14
 
+	SWITCHER_RESTORE_CR3 save_reg=%r14
+
 	/* Handle the three GSBASE cases */
 	ALTERNATIVE "jmp .Lparanoid_exit_checkgs", "", X86_FEATURE_FSGSBASE
 
@@ -1028,6 +1072,11 @@ SYM_CODE_START(error_entry)
 	UNTRAIN_RET_FROM_CALL
 
 	leaq	8(%rsp), %rdi			/* arg0 = pt_regs pointer */
+.Lerror_entry_from_usermode:
+#ifdef CONFIG_X86_PVM_SWITCHER
+	ALTERNATIVE "", __stringify(cmpq $0, TSS_extra(host_rsp); jne .Lerror_entry_from_pvm_guest), \
+		    X86_FEATURE_PVM_HOST
+#endif
 	/* Put us onto the real thread stack. */
 	jmp	sync_regs
 
@@ -1066,9 +1115,38 @@ SYM_CODE_START(error_entry)
 	 */
 .Lerror_entry_done_lfence:
 	FENCE_SWAPGS_KERNEL_ENTRY
+#ifdef CONFIG_X86_PVM_SWITCHER
+	ALTERNATIVE "", __stringify(cmpq $0, TSS_extra(host_rsp); jne .Lerror_entry_switcher_active), \
+		    X86_FEATURE_PVM_HOST
+.Lerror_entry_done:
+#endif
 	CALL_DEPTH_ACCOUNT
 	leaq	8(%rsp), %rax			/* return pt_regs pointer */
 	RET
+
+#ifdef CONFIG_X86_PVM_SWITCHER
+.Lerror_entry_switcher_active:
+	/*
+	 * A kernel-mode exception while the PVM switcher is active, e.g. in
+	 * an NMI handler or in the switcher itself: run the handler on the
+	 * host CR3.  idtentry_body reloads the CR3 saved in %r14 afterwards.
+	 */
+	movq	%cr3, %r14
+	movq	TSS_extra(host_cr3), %rcx
+	movq	%rcx, %cr3
+	jmp	.Lerror_entry_done
+
+.Lerror_entry_from_pvm_guest:
+	/*
+	 * An event from a running PVM guest.  Its registers stay on the sp0
+	 * stack, where the switcher expects them, and a non-zero %r14 tells
+	 * idtentry_body to hand them over.
+	 */
+	movl	$1, %r14d
+	movq	%rdi, %rax
+	CALL_DEPTH_ACCOUNT
+	RET
+#endif
 
 .Lbstep_iret:
 	/* Fix truncated RIP */
@@ -1093,7 +1171,7 @@ SYM_CODE_START(error_entry)
 	leaq	8(%rsp), %rdi			/* arg0 = pt_regs pointer */
 	call	fixup_bad_iret
 	mov	%rax, %rdi
-	jmp	sync_regs
+	jmp	.Lerror_entry_from_usermode
 SYM_CODE_END(error_entry)
 
 SYM_CODE_START_LOCAL(error_return)
@@ -1179,6 +1257,12 @@ SYM_CODE_START(asm_exc_nmi)
 	SWITCH_TO_KERNEL_CR3 scratch_reg=%rdx
 	movq	%rsp, %rdx
 	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+#ifdef CONFIG_X86_PVM_SWITCHER
+	/* An NMI from a PVM guest builds its frame where the switcher wants it. */
+	ALTERNATIVE "", __stringify(cmpq $0, TSS_extra(host_rsp); jz 1f;		\
+				    movq PER_CPU_VAR(cpu_tss_rw + TSS_sp0), %rsp; 1:), \
+		    X86_FEATURE_PVM_HOST
+#endif
 	UNWIND_HINT_IRET_REGS base=%rdx offset=8
 	pushq	5*8(%rdx)	/* pt_regs->ss */
 	pushq	4*8(%rdx)	/* pt_regs->rsp */
@@ -1192,6 +1276,11 @@ SYM_CODE_START(asm_exc_nmi)
 
 	IBRS_ENTER
 	UNTRAIN_RET
+
+#ifdef CONFIG_X86_PVM_SWITCHER
+	ALTERNATIVE "", __stringify(cmpq $0, TSS_extra(host_rsp); jne .Lnmi_from_pvm_guest), \
+		    X86_FEATURE_PVM_HOST
+#endif
 
 	/*
 	 * At this point we no longer need to worry about stack damage
@@ -1207,6 +1296,12 @@ SYM_CODE_START(asm_exc_nmi)
 	 * work, because we don't want to enable interrupts.
 	 */
 	jmp	swapgs_restore_regs_and_return_to_usermode
+
+#ifdef CONFIG_X86_PVM_SWITCHER
+.Lnmi_from_pvm_guest:
+	movl	$X86_TRAP_NMI, ORIG_RAX_VECTOR(%rsp)
+	jmp	switcher_return_from_guest
+#endif
 
 .Lnmi_from_kernel:
 	/*
@@ -1426,6 +1521,8 @@ end_repeat_nmi:
 	IBRS_EXIT save_reg=%r15
 
 	PARANOID_RESTORE_CR3 scratch_reg=%r15 save_reg=%r14
+
+	SWITCHER_RESTORE_CR3 save_reg=%r14
 
 	/*
 	 * The above invocation of paranoid_entry stored the GSBASE
