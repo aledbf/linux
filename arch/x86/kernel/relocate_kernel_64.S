@@ -318,8 +318,11 @@ SYM_CODE_START_LOCAL_NOALIGN(virtual_mapped)
 	movq	%r8, %cr0
 
 #ifdef CONFIG_KEXEC_JUMP
-	/* Saved in save_processor_state. */
-	movq    $saved_context, %rax
+	/*
+	 * Saved in save_processor_state().  This runs from the copy in the
+	 * control page, so saved_context cannot be addressed %rip-relative.
+	 */
+	movabsq	$saved_context, %rax
 	lgdt    saved_context_gdt_desc(%rax)
 #endif
 
