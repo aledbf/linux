@@ -18,6 +18,30 @@
 DEFINE_PER_CPU_PAGE_ALIGNED(struct pvm_vcpu_struct, pvm_vcpu_struct);
 static DEFINE_PER_CPU(unsigned long, pvm_guest_cr3);
 
+/* PVM_CPUID_FEATURES.ebx: the PVM_FEATURE_* the hypervisor offers. */
+static u32 pvm_features __ro_after_init;
+
+/*
+ * PVM_FEATURE_DIRECT_PF: take user not-present faults that the hypervisor
+ * delivers without walking our page tables.  The price is the occasional
+ * fault on a PTE that is already present, which do_user_addr_fault() handles
+ * like any fault that finds the mapping in place -- it returns, and counts a
+ * minor fault.  Such a fault carries no X86_PF_PK even when a protection key
+ * denies the access; access_error() and bad_area_access_from_pkeys() check
+ * the VMA's key against read_pkru() and deliver SEGV_PKUERR all the same.
+ *
+ * "pvm_direct_pf=off" declines the feature, to tell whether a fault handling
+ * problem, such as a task that keeps faulting on the same address, comes from
+ * the direct delivery or the hypervisor's regular path.
+ */
+static bool pvm_direct_pf __ro_after_init = true;
+
+static int __init parse_pvm_direct_pf(char *arg)
+{
+	return kstrtobool(arg, &pvm_direct_pf);
+}
+early_param("pvm_direct_pf", parse_pvm_direct_pf);
+
 /*
  * Until idt.c installs the real handlers, early events go to
  * do_early_exception(), as they would through the early IDT.
@@ -378,6 +402,11 @@ void __init pvm_early_setup(void)
 	if (!(ecx & BIT(13)))		/* CPUID.1:ECX.CX16 */
 		panic("PVM guest requires CMPXCHG16B");
 
+	eax = PVM_CPUID_FEATURES;
+	ecx = 0;
+	pvm_cpuid(&eax, &ebx, &ecx, &edx);
+	pvm_features = ebx;
+
 	setup_force_cpu_cap(X86_FEATURE_KVM_PVM_GUEST);
 	setup_force_cpu_cap(X86_FEATURE_PV_GUEST);
 
@@ -449,6 +478,13 @@ void pvm_setup_event_handling(void)
 	pvm_register_pvcs();
 	wrmsrq(MSR_PVM_EVENT_ENTRY, (unsigned long)pvm_user_event_entry);
 	wrmsrq(MSR_PVM_RETU_RIP, (unsigned long)pvm_retu_rip);
+
+	/*
+	 * Only now: a direct fault arrives at pvm_user_event_entry.  The MSR
+	 * is per vCPU, so every CPU enables it for itself.
+	 */
+	if (pvm_direct_pf && (pvm_features & PVM_FEATURE_DIRECT_PF))
+		wrmsrq(MSR_PVM_FEATURES_ENABLED, PVM_FEATURE_DIRECT_PF);
 
 	/*
 	 * The PVM spec requires the hypervisor-maintained MSR_KERNEL_GS_BASE

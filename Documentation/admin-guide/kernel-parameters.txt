@@ -5608,6 +5608,16 @@ Kernel parameters
 			[KNL] Number of legacy pty's. Overwrites compiled-in
 			default number.
 
+	pvm_direct_pf=	[X86-64,PV_OPS,EARLY] As a PVM guest, enable
+			PVM_FEATURE_DIRECT_PF if the hypervisor offers it: user
+			not-present page faults may be delivered without a
+			hypervisor exit, occasionally for a page that is
+			already mapped.  Turning it off makes the hypervisor
+			handle every such fault itself, which helps to tell a
+			problem in the direct delivery from one elsewhere.
+			Format: <bool>
+			Default: on
+
 	quiet		[KNL,EARLY] Disable most log messages
 
 	r128=		[HW,DRM]
