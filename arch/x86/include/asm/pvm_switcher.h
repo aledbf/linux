@@ -24,6 +24,14 @@
 #include <asm/processor-flags.h>
 
 /*
+ * How many shadowed guest page tables the switcher can choose between without
+ * exiting.  One more than KVM_MMU_NUM_PREV_ROOTS, so the current root and
+ * every cached one fit; the switcher scans them linearly, so it is small on
+ * purpose.
+ */
+#define PVM_PGTBL_CACHE_SIZE			4
+
+/*
  * On return from switcher_enter_guest(), pt_regs::orig_ax holds the exit
  * vector in its upper half and the error code in its lower half: ~0 for an
  * exception or interrupt without one, 0 for SWITCH_EXIT_REASONS_SYSCALL, the
@@ -120,6 +128,40 @@ struct tss_extra {
 	 * synthetic instruction.
 	 */
 	unsigned long umod_cr3;
+	/*
+	 * Guest page tables the hypervisor has already shadowed, so that the
+	 * switcher can serve PVM_HC_LOAD_PGTBL without leaving the guest.
+	 *
+	 * Each entry holds a guest CR3 and the hardware CR3 of both modes, so
+	 * that loading one keeps the direct mode switch working.  The
+	 * hypervisor refills the table from its cached roots before every VM
+	 * entry (pvm_publish_pgtbl_cache()), so an entry is valid for one guest
+	 * run only.  guest_cr3 == 0 marks an empty entry: a guest CR3 of 0
+	 * cannot be loaded.
+	 */
+	struct pvm_pgtbl_entry {
+		unsigned long guest_cr3;
+		unsigned long smod_cr3;
+		unsigned long umod_cr3;
+	} pgtbl[PVM_PGTBL_CACHE_SIZE];
+	/*
+	 * The guest CR3 the switcher last loaded from the table, or 0 if it
+	 * loaded none.  This is how the hypervisor learns, on the next exit,
+	 * that the guest changed address space behind its back -- the same
+	 * shape as the smod/umod toggle it already reconciles after each run.
+	 */
+	unsigned long pgtbl_switched;
+	/*
+	 * The exact PVM_HC_LOAD_PGTBL flags word the fast path may serve.  It
+	 * is not enough to require the TLB bit clear: the guest also sends its
+	 * paging level, and the hypervisor's handler turns a change there into
+	 * a CR4 update and an MMU reset.  Serving that in the switcher would
+	 * leave CR4 describing the wrong paging level, so require the whole
+	 * word to equal what the hypervisor says means "nothing to do but load
+	 * it", and let anything else exit.
+	 */
+	unsigned long pgtbl_flags;
+
 	/*
 	 * The current PVCS for saving and restoring guest user mode context
 	 * in direct switching.

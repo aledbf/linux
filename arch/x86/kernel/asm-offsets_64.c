@@ -72,8 +72,16 @@ int main(void)
 	ENTRY(smod_gsbase);
 	ENTRY(pku_on);
 	ENTRY(smod_pkru);
+	ENTRY(pgtbl);
+	ENTRY(pgtbl_switched);
+	ENTRY(pgtbl_flags);
 	BLANK();
 #undef ENTRY
+	DEFINE(PVM_PGTBL_ENTRY_SIZE, sizeof(struct pvm_pgtbl_entry));
+	OFFSET(PVM_PGTBL_guest_cr3, pvm_pgtbl_entry, guest_cr3);
+	OFFSET(PVM_PGTBL_smod_cr3, pvm_pgtbl_entry, smod_cr3);
+	OFFSET(PVM_PGTBL_umod_cr3, pvm_pgtbl_entry, umod_cr3);
+	BLANK();
 #endif
 
 #if defined(CONFIG_X86_PVM_SWITCHER) || defined(CONFIG_PVM_GUEST)

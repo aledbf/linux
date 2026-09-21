@@ -11,6 +11,40 @@
 #include "calling.h"
 
 /*
+ * One entry of the published page-table table.  The switcher only reads it;
+ * pvm_publish_pgtbl_cache() rewrites the whole table before every VM entry.
+ */
+#define TSS_pgtbl(i, field)						\
+	PER_CPU_VAR(cpu_tss_rw + TSS_EX_pgtbl +				\
+		    (i) * PVM_PGTBL_ENTRY_SIZE + PVM_PGTBL_##field)
+
+/*
+ * Compare the guest CR3 the guest asked for, in %r10, against one published
+ * entry.  On a match leave the entry's index in the table implicit by jumping
+ * to its own loader; otherwise fall through to the next.
+ */
+.macro PGTBL_TRY i
+	cmpq	%r10, TSS_pgtbl(\i, guest_cr3)
+	jne	.L_switcher_pgtbl_next_\i
+	/*
+	 * NO_DS_CR3 describes the address space that is loaded, so it has to
+	 * be recomputed for the new one, whatever it was for the old one: set
+	 * when the entry has no user-mode root, which leaves the direct switch
+	 * to user mode without a CR3 to load, and cleared otherwise.
+	 */
+	movq	TSS_pgtbl(\i, umod_cr3), %rdi
+	testq	%rdi, %rdi
+	jz	1f
+	movq	%rdi, TSS_extra(umod_cr3)
+	andq	$~SWITCH_FLAGS_NO_DS_CR3, TSS_extra(switch_flags)
+	jmp	2f
+1:	orq	$SWITCH_FLAGS_NO_DS_CR3, TSS_extra(switch_flags)
+2:	movq	TSS_pgtbl(\i, smod_cr3), %rdi
+	jmp	.L_switcher_pgtbl_found
+.L_switcher_pgtbl_next_\i:
+.endm
+
+/*
  * Protection keys across a guest mode switch.
  *
  * One hardware PKRU and a guest at CPL 3 in both modes: the register has to be
@@ -240,6 +274,21 @@ SYM_INNER_LABEL(entry_SYSRETQ_switcher_unsafe_stack, SYM_L_GLOBAL)
 .L_switcher_check_return_umod_instruction:
 	UNWIND_HINT_IRET_REGS offset=8
 
+	/*
+	 * PVM_HC_LOAD_PGTBL for a root the hypervisor published is served
+	 * here without an exit; RAX is left as the guest passed it.
+	 *
+	 * Tested on SMOD only, not on SWITCH_FLAGS_NO_DS_TO_UMOD: NO_DS_CR3
+	 * describes the address space being left, and the other inhibitors
+	 * concern mode switches, not page-table loads.  A pending interrupt is
+	 * not delayed: the guest asks for its window with PVM_HC_IRQ_WIN.
+	 */
+	testq	$SWITCH_FLAGS_SMOD, TSS_extra(switch_flags)
+	jz	.L_switcher_no_pgtbl_fastpath
+	cmpq	$PVM_HC_LOAD_PGTBL, %rax
+	je	.L_switcher_load_pgtbl
+.L_switcher_no_pgtbl_fastpath:
+
 	/* check if it can do direct switch from smod to umod */
 	testq	$SWITCH_FLAGS_NO_DS_TO_UMOD, TSS_extra(switch_flags)
 	jnz	.L_switcher_return_to_hypervisor
@@ -311,6 +360,53 @@ SYM_INNER_LABEL(entry_SYSRETQ_switcher_unsafe_stack, SYM_L_GLOBAL)
 
 .L_switcher_iretq:
 	jmp	native_irq_return_iret
+
+.L_switcher_load_pgtbl:
+	/*
+	 * The guest picks the CR3 to load, but only by its guest CR3 in %r10,
+	 * which must equal an entry the hypervisor published: every hardware
+	 * CR3 below comes from that table, which the hypervisor rebuilds from
+	 * its cached shadow roots before every entry, so a root it has since
+	 * dropped is never there and the guest cannot name anything else.
+	 *
+	 * Only the exact request the hypervisor said needs nothing but the
+	 * load: no TLB flush, and the paging level the guest already has.
+	 * %rbx is the flags argument of the hypercall.
+	 */
+	cmpq	TSS_extra(pgtbl_flags), %rbx
+	jne	.L_switcher_return_to_hypervisor
+
+	PGTBL_TRY 0
+	PGTBL_TRY 1
+	PGTBL_TRY 2
+	PGTBL_TRY 3
+	jmp	.L_switcher_return_to_hypervisor
+
+.L_switcher_pgtbl_found:
+	movq	%rdi, %cr3
+
+	/*
+	 * Keep the direct switch state consistent with the address space that
+	 * is now loaded: umod_cr3 was written by PGTBL_TRY, smod_cr3 is this.
+	 */
+	movq	%rdi, TSS_extra(smod_cr3)
+
+	/* Tell the hypervisor, on its next exit, which one was loaded. */
+	movq	%r10, TSS_extra(pgtbl_switched)
+
+	popq	%rdi					/* saved rdi */
+
+	/*
+	 * Return to the guest GSBASE; the entry swapgs'd to reach TSS_extra.
+	 * Must be last, as TSS_extra is unreachable afterwards.
+	 */
+	swapgs
+
+	/*
+	 * %rcx and %r11 are what the guest's own SYSCALL put there, so %rcx
+	 * is canonical and SYSRET needs no check.
+	 */
+	jmp	.L_switcher_sysretq
 
 .L_switcher_return_to_hypervisor:
 	popq	%rdi					/* saved rdi */

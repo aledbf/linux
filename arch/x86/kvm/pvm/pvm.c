@@ -715,6 +715,142 @@ static u64 get_switch_hw_cr3(struct vcpu_pvm *pvm)
 	return INVALID_PAGE;
 }
 
+/*
+ * Publish the guest page tables the switcher may load by itself.
+ *
+ * Only supervisor roots, since a hypercall can only come from supervisor mode,
+ * each with the user-side root of its pair when prev_roots[] still holds one.
+ * The switcher loads both halves and sets or clears SWITCH_FLAGS_NO_DS_CR3 by
+ * whether the pair exists, so the mode direct switch keeps working in the new
+ * address space exactly when the hypervisor would have allowed it there.
+ *
+ * Rebuilt on every entry, which is what makes this safe: a root the MMU has
+ * stopped tracking simply is not in the next table, so there is no stale
+ * entry to invalidate and no window in which one could be used.
+ */
+static void pvm_publish_pgtbl_cache(struct vcpu_pvm *pvm)
+{
+	struct kvm_mmu *mmu = pvm->vcpu.arch.mmu;
+	struct pvm_pgtbl_entry *tbl = this_cpu_ptr(cpu_tss_rw.tss_ex.pgtbl);
+	union kvm_mmu_page_role smod_role = mmu->root_role;
+	union kvm_mmu_page_role umod_role = mmu->root_role;
+	unsigned int smod_roots = 0, umod_roots = 0;
+	int i, j, n = 0;
+
+	/* The roles the two roots of a pair have; see switch_to_smod(). */
+	kvm_mmu_role_set_user(&smod_role, false);
+	kvm_mmu_role_set_user(&umod_role, true);
+
+	this_cpu_write(cpu_tss_rw.tss_ex.pgtbl_switched, 0);
+
+	/*
+	 * What the guest must ask for if the switcher is to serve it: no TLB
+	 * flush, and the paging level it already has.  pvm_write_cr3() builds
+	 * the word as "(~cr3 >> 63) | LA57 if 5-level", so this is the value
+	 * for an ordinary context switch, where Linux sets CR3.NOFLUSH because
+	 * the ASID is still good.
+	 */
+	this_cpu_write(cpu_tss_rw.tss_ex.pgtbl_flags,
+		       kvm_is_cr4_bit_set(&pvm->vcpu, X86_CR4_LA57) ?
+		       PVM_LOAD_PGTBL_FLAGS_LA57 : 0);
+
+	if (!is_smod(pvm))
+		goto out;
+
+	/*
+	 * The address space the guest is already in.  It is not in
+	 * prev_roots[], and a guest does reload its own CR3 -- switching to a
+	 * thread of the same process, or back from a lazy-TLB kernel thread.
+	 * Both halves are the ones just written for the mode direct switch.
+	 */
+	tbl[n].guest_cr3 = pvm->vcpu.arch.cr3 & ~X86_CR3_PCID_NOFLUSH;
+	tbl[n].smod_cr3 = this_cpu_read(cpu_tss_rw.tss_ex.smod_cr3);
+	tbl[n].umod_cr3 = this_cpu_read(cpu_tss_rw.tss_ex.umod_cr3);
+	if (tbl[n].umod_cr3 == INVALID_PAGE)
+		tbl[n].umod_cr3 = 0;
+	if (tbl[n].guest_cr3)
+		n++;
+
+	/*
+	 * One pass over prev_roots[] to sort them into the two halves of a
+	 * pair, then the pairing itself by pgd, which needs no further look at
+	 * the shadow pages.  The predicate is the one get_switch_hw_cr3() uses,
+	 * and for the same reason: a root is only usable if its whole role
+	 * matches the one the MMU is running with, not merely its mode.  A root
+	 * left in prev_roots[] from before an MMU reset has a stale role and
+	 * points at a tree built for different rules.
+	 */
+	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++) {
+		struct kvm_mmu_root_info *r = &mmu->prev_roots[i];
+
+		if (!r->pgd)
+			continue;
+		if (is_root_usable(r, r->pgd, smod_role))
+			smod_roots |= BIT(i);
+		else if (is_root_usable(r, r->pgd, umod_role))
+			umod_roots |= BIT(i);
+	}
+
+	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS && n < PVM_PGTBL_CACHE_SIZE; i++) {
+		struct kvm_mmu_root_info *r = &mmu->prev_roots[i];
+		u64 hw_cr3;
+		u32 pcid;
+
+		if (!(smod_roots & BIT(i)))
+			continue;
+
+		/*
+		 * The user-side root of the pair, if it is still cached.  Three
+		 * prev_roots slots and two per pair means it often is not, so
+		 * an entry without one is still worth publishing: the switcher
+		 * takes it and turns off the mode direct switch for that one
+		 * address space, which costs an exit per return to user mode
+		 * instead of an exit per context switch.
+		 */
+		for (j = 0; j < KVM_MMU_NUM_PREV_ROOTS; j++)
+			if ((umod_roots & BIT(j)) && mmu->prev_roots[j].pgd == r->pgd)
+				break;
+
+		hw_cr3 = __sme_set(r->hpa);
+		pcid = guest_pcid_to_host_pcid(pvm, r->pgd & X86_CR3_PCID_MASK, true);
+		hw_cr3 |= pcid | CR3_NOFLUSH;
+
+		/*
+		 * Built the way pvm_set_host_cr3_for_guest() builds the roots it
+		 * hands the switcher, including this: guest PCID index 0 is the
+		 * fallback every guest PCID above 7 lands on, so it is shared
+		 * and has to be force flushed.  Publishing it with NOFLUSH set
+		 * would let the switcher load an address space with another
+		 * one's translations still live.
+		 */
+		if (unlikely(!(pcid & PVM_GUEST_PCID_INDEX_MASK)))
+			hw_cr3 &= ~CR3_NOFLUSH;
+
+		tbl[n].guest_cr3 = r->pgd;
+		tbl[n].smod_cr3 = hw_cr3;
+		tbl[n].umod_cr3 = 0;
+		if (j < KVM_MMU_NUM_PREV_ROOTS) {
+			/*
+			 * The pair shares an ASID and a guest PCID and differs
+			 * only in the PTI bit, which is how get_switch_hw_cr3()
+			 * builds the other side.
+			 */
+			tbl[n].umod_cr3 = __sme_set(mmu->prev_roots[j].hpa) |
+					  (pcid ^ PVM_UMOD_PCID_MASK) |
+					  (hw_cr3 & CR3_NOFLUSH);
+		}
+		n++;
+	}
+
+out:
+	/* 0 is the empty marker: a guest CR3 of 0 has no PGD and cannot load. */
+	for (; n < PVM_PGTBL_CACHE_SIZE; n++) {
+		tbl[n].guest_cr3 = 0;
+		tbl[n].smod_cr3 = 0;
+		tbl[n].umod_cr3 = 0;
+	}
+}
+
 static void pvm_set_host_cr3_for_guest(struct vcpu_pvm *pvm)
 {
 	u64 hw_cr3 = __sme_set(pvm->vcpu.arch.mmu->root.hpa);
@@ -759,6 +895,8 @@ static void pvm_set_host_cr3_for_guest(struct vcpu_pvm *pvm)
 		pvm->switch_flags &= ~SWITCH_FLAGS_NO_DS_CR3;
 	else
 		pvm->switch_flags |= SWITCH_FLAGS_NO_DS_CR3;
+
+	pvm_publish_pgtbl_cache(pvm);
 }
 
 static void pvm_set_host_cr3_for_hypervisor(struct vcpu_pvm *pvm)
@@ -1901,7 +2039,8 @@ static int handle_hc_load_pagetables(struct kvm_vcpu *vcpu, unsigned long flags,
 	 * NOFLUSH without CR4.PCIDE -- is what MOV to CR3 answers with #GP, so
 	 * do the same, with the paging level left as it was, rather than
 	 * return to a guest that believes it switched address space and did
-	 * not.
+	 * not.  There is no return value to use instead: the switcher serves
+	 * this hypercall without touching RAX.
 	 */
 	if (kvm_set_cr3(vcpu, (flags & PVM_LOAD_PGTBL_FLAGS_TLB) ?
 			      pgd : pgd | CR3_NOFLUSH)) {
@@ -2876,6 +3015,7 @@ static fastpath_t pvm_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 {
 	struct vcpu_pvm *pvm = to_pvm(vcpu);
 	bool is_smod_before_run = is_smod(pvm);
+	unsigned long pgtbl_switched;
 
 	/*
 	 * Don't enter the guest if its state is invalid: the exit handler
@@ -2927,6 +3067,28 @@ static fastpath_t pvm_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 	 */
 	if (likely(pvm->pvcs))
 		vcpu->arch.cr2 = READ_ONCE(pvm->pvcs->cr2);
+
+	/*
+	 * The switcher may have loaded one of the page tables published in
+	 * tss_ex.pgtbl, which is a guest address space change the hypervisor
+	 * has not seen.  Catch up: the value came from prev_roots[] one entry
+	 * ago, so kvm_mmu_new_pgd() finds the same root again rather than
+	 * building anything.
+	 *
+	 * After the mode reconcile above.  The mode direct switch stays live
+	 * across this path, so the guest may have changed mode after the load
+	 * as well as before it, and possibly more than once.  Neither order
+	 * matters here: the reconcile only settles which role the MMU is in,
+	 * and kvm_mmu_new_pgd() then looks the loaded address space up under
+	 * that role -- the root of the pair, both of which were published
+	 * from prev_roots[] and are still among the cached roots.
+	 */
+	pgtbl_switched = this_cpu_read(cpu_tss_rw.tss_ex.pgtbl_switched);
+	if (unlikely(pgtbl_switched)) {
+		this_cpu_write(cpu_tss_rw.tss_ex.pgtbl_switched, 0);
+		vcpu->arch.cr3 = pgtbl_switched;
+		kvm_mmu_new_pgd(vcpu, pgtbl_switched);
+	}
 
 	/* MSR_IA32_DEBUGCTLMSR is zeroed before vmenter. Restore it if needed */
 	if (pvm->host_debugctlmsr)
