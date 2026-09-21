@@ -62,6 +62,15 @@ SYM_PIC_ALIAS(ptrs_per_p4d);
 
 unsigned long page_offset_base __ro_after_init = __PAGE_OFFSET_BASE_L4;
 EXPORT_SYMBOL(page_offset_base);
+#ifdef CONFIG_X86_PIE
+/*
+ * The virtual base the kernel image is mapped at.  Exported like
+ * page_offset_base, as __pa() and virt_to_page() use it in any module.
+ */
+unsigned long kernel_map_base __ro_after_init = __START_KERNEL_map;
+EXPORT_SYMBOL(kernel_map_base);
+SYM_PIC_ALIAS(kernel_map_base);
+#endif
 unsigned long vmalloc_base __ro_after_init = __VMALLOC_BASE_L4;
 EXPORT_SYMBOL(vmalloc_base);
 unsigned long vmemmap_base __ro_after_init = __VMEMMAP_BASE_L4;
@@ -70,7 +79,12 @@ EXPORT_SYMBOL(vmemmap_base);
 /* Wipe all early page tables except for the kernel symbol map */
 static void __init reset_early_page_tables(void)
 {
-	memset(early_top_pgt, 0, sizeof(pgd_t)*(PTRS_PER_PGD-1));
+	/* Clear every slot except the one of the kernel image mapping. */
+	unsigned int keep = pgd_index(KERNEL_MAP_BASE);
+
+	memset(early_top_pgt, 0, sizeof(pgd_t) * keep);
+	memset(&early_top_pgt[keep + 1], 0,
+	       sizeof(pgd_t) * (PTRS_PER_PGD - keep - 1));
 	next_early_pgt = 0;
 	write_cr3(__sme_pa_nodebug(early_top_pgt));
 }
@@ -100,7 +114,7 @@ again:
 	if (!pgtable_l5_enabled())
 		p4d_p = pgd_p;
 	else if (pgd)
-		p4d_p = (p4dval_t *)((pgd & PTE_PFN_MASK) + __START_KERNEL_map - phys_base);
+		p4d_p = (p4dval_t *)((pgd & PTE_PFN_MASK) + KERNEL_MAP_BASE - phys_base);
 	else {
 		if (next_early_pgt >= EARLY_DYNAMIC_PAGE_TABLES) {
 			reset_early_page_tables();
@@ -109,13 +123,13 @@ again:
 
 		p4d_p = (p4dval_t *)early_dynamic_pgts[next_early_pgt++];
 		memset(p4d_p, 0, sizeof(*p4d_p) * PTRS_PER_P4D);
-		*pgd_p = (pgdval_t)p4d_p - __START_KERNEL_map + phys_base + _KERNPG_TABLE;
+		*pgd_p = (pgdval_t)p4d_p - KERNEL_MAP_BASE + phys_base + _KERNPG_TABLE;
 	}
 	p4d_p += p4d_index(address);
 	p4d = *p4d_p;
 
 	if (p4d)
-		pud_p = (pudval_t *)((p4d & PTE_PFN_MASK) + __START_KERNEL_map - phys_base);
+		pud_p = (pudval_t *)((p4d & PTE_PFN_MASK) + KERNEL_MAP_BASE - phys_base);
 	else {
 		if (next_early_pgt >= EARLY_DYNAMIC_PAGE_TABLES) {
 			reset_early_page_tables();
@@ -124,13 +138,13 @@ again:
 
 		pud_p = (pudval_t *)early_dynamic_pgts[next_early_pgt++];
 		memset(pud_p, 0, sizeof(*pud_p) * PTRS_PER_PUD);
-		*p4d_p = (p4dval_t)pud_p - __START_KERNEL_map + phys_base + _KERNPG_TABLE;
+		*p4d_p = (p4dval_t)pud_p - KERNEL_MAP_BASE + phys_base + _KERNPG_TABLE;
 	}
 	pud_p += pud_index(address);
 	pud = *pud_p;
 
 	if (pud)
-		pmd_p = (pmdval_t *)((pud & PTE_PFN_MASK) + __START_KERNEL_map - phys_base);
+		pmd_p = (pmdval_t *)((pud & PTE_PFN_MASK) + KERNEL_MAP_BASE - phys_base);
 	else {
 		if (next_early_pgt >= EARLY_DYNAMIC_PAGE_TABLES) {
 			reset_early_page_tables();
@@ -139,7 +153,7 @@ again:
 
 		pmd_p = (pmdval_t *)early_dynamic_pgts[next_early_pgt++];
 		memset(pmd_p, 0, sizeof(*pmd_p) * PTRS_PER_PMD);
-		*pud_p = (pudval_t)pmd_p - __START_KERNEL_map + phys_base + _KERNPG_TABLE;
+		*pud_p = (pudval_t)pmd_p - KERNEL_MAP_BASE + phys_base + _KERNPG_TABLE;
 	}
 	pmd_p[pmd_index(address)] = pmd;
 
@@ -224,14 +238,17 @@ asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode
 	/*
 	 * Build-time sanity checks on the kernel image and module
 	 * area mappings. (these are purely build-time and produce no code)
+	 *
+	 * Assert on the link-time layout; MODULES_END is a variable under
+	 * CONFIG_X86_PIE, and the layout moves as a whole.
 	 */
-	BUILD_BUG_ON(MODULES_VADDR < __START_KERNEL_map);
-	BUILD_BUG_ON(MODULES_VADDR - __START_KERNEL_map < KERNEL_IMAGE_SIZE);
+	BUILD_BUG_ON(RAW_MODULES_VADDR < __START_KERNEL_map);
+	BUILD_BUG_ON(RAW_MODULES_VADDR - __START_KERNEL_map < KERNEL_IMAGE_SIZE);
 	BUILD_BUG_ON(MODULES_LEN + KERNEL_IMAGE_SIZE > 2*PUD_SIZE);
 	BUILD_BUG_ON((__START_KERNEL_map & ~PMD_MASK) != 0);
-	BUILD_BUG_ON((MODULES_VADDR & ~PMD_MASK) != 0);
-	BUILD_BUG_ON(!(MODULES_VADDR > __START_KERNEL));
-	MAYBE_BUILD_BUG_ON(!(((MODULES_END - 1) & PGDIR_MASK) ==
+	BUILD_BUG_ON((RAW_MODULES_VADDR & ~PMD_MASK) != 0);
+	BUILD_BUG_ON(!(RAW_MODULES_VADDR > __START_KERNEL));
+	MAYBE_BUILD_BUG_ON(!(((RAW_MODULES_END - 1) & PGDIR_MASK) ==
 				(__START_KERNEL & PGDIR_MASK)));
 	BUILD_BUG_ON(__fix_to_virt(__end_of_fixed_addresses) <= MODULES_END);
 
@@ -285,8 +302,9 @@ asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode
 	 */
 	load_ucode_bsp();
 
-	/* set init_top_pgt kernel high mapping*/
-	init_top_pgt[511] = early_top_pgt[511];
+	/* The kernel mapping is at pgd_index(KERNEL_MAP_BASE). */
+	init_top_pgt[pgd_index(KERNEL_MAP_BASE)] =
+		early_top_pgt[pgd_index(KERNEL_MAP_BASE)];
 
 	x86_64_start_reservations(real_mode_data);
 }

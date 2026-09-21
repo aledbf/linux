@@ -180,7 +180,14 @@ SYM_INNER_LABEL(secondary_startup_64_no_verify, SYM_L_GLOBAL)
 
 	/* Derive the runtime physical address of init_top_pgt[] */
 	movq	phys_base(%rip), %rax
+#ifdef CONFIG_X86_PIE
+	/* The immediate is relocated, so subtract the runtime kernel map base. */
+	movabsq	$init_top_pgt, %rcx
+	subq	kernel_map_base(%rip), %rcx
+	addq	%rcx, %rax
+#else
 	addq	$(init_top_pgt - __START_KERNEL_map), %rax
+#endif
 
 	/*
 	 * Retrieve the modifier (SME encryption mask if SME is active) to be

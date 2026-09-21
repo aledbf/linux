@@ -22,10 +22,10 @@ extern unsigned long direct_map_physmem_end;
 
 static __always_inline unsigned long __phys_addr_nodebug(unsigned long x)
 {
-	unsigned long y = x - __START_KERNEL_map;
+	unsigned long y = x - KERNEL_MAP_BASE;
 
-	/* use the carry flag to determine if x was < __START_KERNEL_map */
-	x = y + ((x > y) ? phys_base : (__START_KERNEL_map - PAGE_OFFSET));
+	/* use the carry flag to determine if x was < KERNEL_MAP_BASE */
+	x = y + ((x > y) ? phys_base : (KERNEL_MAP_BASE - PAGE_OFFSET));
 
 	return x;
 }
@@ -38,7 +38,7 @@ extern unsigned long __phys_addr(unsigned long);
 
 static inline unsigned long __phys_addr_symbol(unsigned long x)
 {
-	unsigned long y = x - __START_KERNEL_map;
+	unsigned long y = x - KERNEL_MAP_BASE;
 
 	/* only check upper bounds since lower bounds will trigger carry */
 	VIRTUAL_BUG_ON(y >= KERNEL_IMAGE_SIZE);

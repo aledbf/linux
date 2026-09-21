@@ -108,7 +108,7 @@ static int __init acpi_mp_setup_reset(u64 reset_vector)
 	 * function must be present at the same spot in the virtual address space
 	 * before and after switching page tables.
 	 */
-	info.offset = __START_KERNEL_map - phys_base;
+	info.offset = KERNEL_MAP_BASE - phys_base;
 	mstart = PAGE_ALIGN_DOWN(__pa(asm_acpi_mp_play_dead));
 	mend = mstart + PAGE_SIZE;
 	if (kernel_ident_mapping_init(&info, pgd, mstart, mend)) {

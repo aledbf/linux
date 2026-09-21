@@ -430,7 +430,7 @@ void __init init_extra_mapping_uc(unsigned long phys, unsigned long size)
 /*
  * The head.S code sets up the kernel high mapping:
  *
- *   from __START_KERNEL_map to __START_KERNEL_map + size (== _end-_text)
+ *   from KERNEL_MAP_BASE to KERNEL_MAP_BASE + size (== _end-_text)
  *
  * phys_base holds the negative offset to the kernel, which is added
  * to the compile time generated pmds. This results in invalid pmds up
@@ -442,10 +442,21 @@ void __init init_extra_mapping_uc(unsigned long phys, unsigned long size)
  */
 void __init cleanup_highmap(void)
 {
-	unsigned long vaddr = __START_KERNEL_map;
-	unsigned long vaddr_end = __START_KERNEL_map + KERNEL_IMAGE_SIZE;
+	unsigned long vaddr = KERNEL_MAP_BASE;
+	unsigned long vaddr_end = KERNEL_MAP_BASE + KERNEL_IMAGE_SIZE;
 	unsigned long end = roundup((unsigned long)_brk_end, PMD_SIZE) - 1;
 	pmd_t *pmd = level2_kernel_pgt;
+
+	/*
+	 * A moved kernel image mapping has to be above the rest of the kernel
+	 * half, see KERNEL_MAP_BASE.  The layout is final by now.
+	 */
+	if (KERNEL_MAP_BASE != __START_KERNEL_map &&
+	    (KERNEL_MAP_BASE < PAGE_OFFSET + (max_pfn << PAGE_SHIFT) ||
+	     KERNEL_MAP_BASE <= VMALLOC_END ||
+	     KERNEL_MAP_BASE < (unsigned long)pfn_to_page(max_pfn)))
+		panic("Kernel image mapping at %#lx overlaps the kernel address space layout\n",
+		      KERNEL_MAP_BASE);
 
 	/*
 	 * Native path, max_pfn_mapped is not set yet.
@@ -453,7 +464,7 @@ void __init cleanup_highmap(void)
 	 *	arch/x86/xen/mmu.c:xen_setup_kernel_pagetable().
 	 */
 	if (max_pfn_mapped)
-		vaddr_end = __START_KERNEL_map + (max_pfn_mapped << PAGE_SHIFT);
+		vaddr_end = KERNEL_MAP_BASE + (max_pfn_mapped << PAGE_SHIFT);
 
 	for (; vaddr + PMD_SIZE - 1 < vaddr_end; pmd++, vaddr += PMD_SIZE) {
 		if (pmd_none(*pmd))

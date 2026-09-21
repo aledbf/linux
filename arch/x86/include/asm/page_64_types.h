@@ -4,6 +4,8 @@
 
 #ifndef __ASSEMBLER__
 #include <asm/kaslr.h>
+
+extern unsigned long kernel_map_base;
 #endif
 
 #ifdef CONFIG_KASAN
@@ -44,6 +46,30 @@
 #define __PAGE_OFFSET           page_offset_base
 
 #define __START_KERNEL_map	_AC(0xffffffff80000000, UL)
+
+/*
+ * KERNEL_MAP_BASE is where the kernel image mapping starts: the image, the
+ * modules area and the fixmap, 2GB in all.  It is __START_KERNEL_map unless
+ * a CONFIG_X86_PIE kernel is moved at boot, and then the new base has to:
+ *
+ *  - be the start of the second to last PUD entry of its PGD entry (with
+ *    5-level paging, of the last P4D entry of its PGD entry), so that only
+ *    the PGD entry of the mapping moves and the tables below it stay;
+ *  - use a PGD entry that the early identity mapping does not;
+ *  - be above PAGE_OFFSET, as pgd_alloc() and the trampoline page table
+ *    only share the PGD entries from pgd_index(PAGE_OFFSET) up;
+ *  - be above the direct mapping, the vmalloc area and the vmemmap, as
+ *    __phys_addr() and __virt_addr_valid() take any address below it for a
+ *    direct mapping address.
+ *
+ * cleanup_highmap() checks the last two, once the layout of the kernel half
+ * is final.
+ */
+#ifdef CONFIG_X86_PIE
+#define KERNEL_MAP_BASE		kernel_map_base
+#else
+#define KERNEL_MAP_BASE		__START_KERNEL_map
+#endif
 
 /* See Documentation/arch/x86/x86_64/mm.rst for a description of the memory map. */
 
