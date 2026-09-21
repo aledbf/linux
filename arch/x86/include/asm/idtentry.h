@@ -438,6 +438,7 @@ __visible noinstr void func(struct pt_regs *regs,			\
 
 void idt_install_sysvec(unsigned int n, const void *function);
 void fred_install_sysvec(unsigned int vector, const idtentry_t function);
+void external_interrupt(struct pt_regs *regs, unsigned int vector);
 
 #define sysvec_install(vector, function) {				\
 	if (IS_ENABLED(CONFIG_X86_FRED))				\

@@ -5,7 +5,6 @@
  */
 #include <linux/kernel.h>
 #include <linux/kdebug.h>
-#include <linux/nospec.h>
 
 #include <asm/desc.h>
 #include <asm/fred.h>
@@ -95,86 +94,9 @@ static __always_inline void fred_other(struct pt_regs *regs)
 	}
 }
 
-#define SYSVEC(_vector, _function) [_vector - FIRST_SYSTEM_VECTOR] = fred_sysvec_##_function
-
-static idtentry_t sysvec_table[NR_SYSTEM_VECTORS] __ro_after_init = {
-	SYSVEC(ERROR_APIC_VECTOR,		error_interrupt),
-	SYSVEC(SPURIOUS_APIC_VECTOR,		spurious_apic_interrupt),
-	SYSVEC(LOCAL_TIMER_VECTOR,		apic_timer_interrupt),
-	SYSVEC(X86_PLATFORM_IPI_VECTOR,		x86_platform_ipi),
-
-	SYSVEC(RESCHEDULE_VECTOR,		reschedule_ipi),
-	SYSVEC(CALL_FUNCTION_SINGLE_VECTOR,	call_function_single),
-	SYSVEC(CALL_FUNCTION_VECTOR,		call_function),
-	SYSVEC(REBOOT_VECTOR,			reboot),
-
-	SYSVEC(THRESHOLD_APIC_VECTOR,		threshold),
-	SYSVEC(DEFERRED_ERROR_VECTOR,		deferred_error),
-	SYSVEC(THERMAL_APIC_VECTOR,		thermal),
-
-	SYSVEC(IRQ_WORK_VECTOR,			irq_work),
-
-	SYSVEC(PERF_GUEST_MEDIATED_PMI_VECTOR,	perf_guest_mediated_pmi_handler),
-	SYSVEC(POSTED_INTR_VECTOR,		kvm_posted_intr_ipi),
-	SYSVEC(POSTED_INTR_WAKEUP_VECTOR,	kvm_posted_intr_wakeup_ipi),
-	SYSVEC(POSTED_INTR_NESTED_VECTOR,	kvm_posted_intr_nested_ipi),
-
-	SYSVEC(POSTED_MSI_NOTIFICATION_VECTOR,	posted_msi_notification),
-};
-
-static bool fred_setup_done __initdata;
-
-void __init fred_install_sysvec(unsigned int sysvec, idtentry_t handler)
+static __always_inline void fred_extint(struct pt_regs *regs)
 {
-	if (WARN_ON_ONCE(sysvec < FIRST_SYSTEM_VECTOR))
-		return;
-
-	if (WARN_ON_ONCE(fred_setup_done))
-		return;
-
-	if (!WARN_ON_ONCE(sysvec_table[sysvec - FIRST_SYSTEM_VECTOR]))
-		 sysvec_table[sysvec - FIRST_SYSTEM_VECTOR] = handler;
-}
-
-static noinstr void fred_handle_spurious_interrupt(struct pt_regs *regs)
-{
-	spurious_interrupt(regs, regs->fred_ss.vector);
-}
-
-void __init fred_complete_exception_setup(void)
-{
-	unsigned int vector;
-
-	for (vector = 0; vector < FIRST_EXTERNAL_VECTOR; vector++)
-		set_bit(vector, system_vectors);
-
-	for (vector = 0; vector < NR_SYSTEM_VECTORS; vector++) {
-		if (sysvec_table[vector])
-			set_bit(vector + FIRST_SYSTEM_VECTOR, system_vectors);
-		else
-			sysvec_table[vector] = fred_handle_spurious_interrupt;
-	}
-	fred_setup_done = true;
-}
-
-static noinstr void fred_extint(struct pt_regs *regs)
-{
-	unsigned int vector = regs->fred_ss.vector;
-
-	if (WARN_ON_ONCE(vector < FIRST_EXTERNAL_VECTOR))
-		return;
-
-	if (likely(vector >= FIRST_SYSTEM_VECTOR)) {
-		irqentry_state_t state = irqentry_enter(regs);
-
-		instrumentation_begin();
-		sysvec_table[array_index_nospec(vector - FIRST_SYSTEM_VECTOR,
-						NR_SYSTEM_VECTORS)](regs);
-		instrumentation_end();
-		irqentry_exit(regs, state);
-	} else {
-		common_interrupt(regs, vector);
-	}
+	external_interrupt(regs, regs->fred_ss.vector);
 }
 
 static noinstr void fred_hwexc(struct pt_regs *regs, unsigned long error_code)

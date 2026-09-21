@@ -87,7 +87,6 @@ static __always_inline void fred_entry_from_kvm(unsigned int type, unsigned int 
 
 void cpu_init_fred_exceptions(void);
 void cpu_init_fred_rsps(void);
-void fred_complete_exception_setup(void);
 
 DECLARE_PER_CPU(unsigned long, fred_rsp0);
 
@@ -109,10 +108,11 @@ static __always_inline void fred_update_rsp0(void)
 static __always_inline unsigned long fred_event_data(struct pt_regs *regs) { return 0; }
 static inline void cpu_init_fred_exceptions(void) { }
 static inline void cpu_init_fred_rsps(void) { }
-static inline void fred_complete_exception_setup(void) { }
 static inline void fred_sync_rsp0(unsigned long rsp0) { }
 static inline void fred_update_rsp0(void) { }
 #endif /* CONFIG_X86_FRED */
+
+void fred_complete_exception_setup(void);
 #endif /* !__ASSEMBLER__ */
 
 #endif /* ASM_X86_FRED_H */
