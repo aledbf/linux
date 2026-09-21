@@ -14,8 +14,10 @@ void die(char *fmt, ...)
 
 static void usage(void)
 {
-	die("relocs [--abs-syms|--abs-relocs|--reloc-info|--text|--realmode]" \
-	    " vmlinux\n");
+	die("relocs [--abs-syms|--abs-relocs|--reloc-info|--text|--realmode|--keep]" \
+	    " vmlinux\n" \
+	    "  --keep  write the table into the .data.reloc section of vmlinux,\n" \
+	    "          in place, instead of to stdout\n");
 }
 
 int main(int argc, char **argv)
@@ -49,6 +51,10 @@ int main(int argc, char **argv)
 				opts.use_real_mode = true;
 				continue;
 			}
+			if (strcmp(arg, "--keep") == 0) {
+				opts.keep_relocs = true;
+				continue;
+			}
 		}
 		else if (!fname) {
 			fname = arg;
@@ -59,7 +65,11 @@ int main(int argc, char **argv)
 	if (!fname) {
 		usage();
 	}
-	fp = fopen(fname, "r");
+	if (opts.keep_relocs &&
+	    (opts.as_text || opts.use_real_mode || opts.show_absolute_syms ||
+	     opts.show_absolute_relocs || opts.show_reloc_info))
+		die("--keep cannot be combined with other options\n");
+	fp = fopen(fname, opts.keep_relocs ? "r+" : "r");
 	if (!fp) {
 		die("Cannot open %s: %s\n", fname, strerror(errno));
 	}
@@ -71,6 +81,7 @@ int main(int argc, char **argv)
 		process_64(fp);
 	else
 		process_32(fp);
-	fclose(fp);
+	if (fclose(fp))
+		die("Cannot write %s: %s\n", fname, strerror(errno));
 	return 0;
 }

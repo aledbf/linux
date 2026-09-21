@@ -737,6 +737,18 @@ static void walk_relocs(int (*process)(struct section *sec, Elf_Rel *rel,
 
 #if ELF_BITS == 64
 
+static struct section *sec_lookup(const char *name)
+{
+	int i;
+
+	for (i = 0; i < shnum; i++) {
+		if (!strcmp(sec_name(i), name))
+			return &secs[i];
+	}
+
+	return NULL;
+}
+
 static int do_reloc64(struct section *sec, Elf_Rel *rel, ElfW(Sym) *sym,
 		      const char *symname)
 {
@@ -950,9 +962,10 @@ static int write32_as_text(uint32_t v, FILE *f)
 	return fprintf(f, "\t.long 0x%08"PRIx32"\n", v) > 0 ? 0 : -1;
 }
 
-static void emit_relocs(void)
+static void emit_relocs(FILE *vmlinux)
 {
 	int i;
+	FILE *outf = stdout;
 	int (*write_reloc)(uint32_t, FILE *) = write32;
 	int (*do_reloc)(struct section *sec, Elf_Rel *rel, Elf_Sym *sym, const char *symname);
 
@@ -962,6 +975,9 @@ static void emit_relocs(void)
 	else
 		die("--realmode not valid for a 64-bit ELF file");
 #else
+	if (opts.keep_relocs)
+		die("--keep not valid for a 32-bit ELF file\n");
+
 	if (!opts.use_real_mode)
 		do_reloc = do_reloc32;
 	else
@@ -992,30 +1008,69 @@ static void emit_relocs(void)
 		write_reloc = write32_as_text;
 	}
 
-	if (opts.use_real_mode) {
-		write_reloc(relocs16.count, stdout);
-		for (i = 0; i < relocs16.count; i++)
-			write_reloc(relocs16.offset[i], stdout);
+#if ELF_BITS == 64
+	/*
+	 * Write the table into the space vmlinux reserves for it at the end of
+	 * .data.reloc, in the format the decompressor reads.  As there, each
+	 * entry is the low 32 bits of the link-time address of a place to fix
+	 * up, which the reader sign-extends; that only recovers the address
+	 * because vmlinux is linked in the top 2GB of the address space.
+	 */
+	if (opts.keep_relocs) {
+		struct section *sec_reloc;
+		uint32_t size_needed;
+		unsigned long offset;
 
-		write_reloc(relocs32.count, stdout);
+		/*
+		 * The kernel relocates itself to a 64-bit address, which a
+		 * 32-bit field cannot hold.
+		 */
+		if (relocs32.count)
+			die("32-bit relocations found in a kernel relocated by --keep\n");
+
+		sec_reloc = sec_lookup(".data.reloc");
+		if (!sec_reloc)
+			die("Could not find relocation data section\n");
+
+		/* Two stop words, plus the 64-bit table. */
+		size_needed = (2 + relocs64.count) * sizeof(uint32_t);
+		if (size_needed > sec_reloc->shdr.sh_size)
+			die("Relocations overflow the space reserved in .data.reloc, which needs at least 0x%08x bytes\n",
+			    (size_needed + 0xfff) & ~0xfff);
+
+		offset = sec_reloc->shdr.sh_offset + sec_reloc->shdr.sh_size -
+			 size_needed;
+		if (fseek(vmlinux, offset, SEEK_SET) < 0)
+			die("Seek to %ld failed: %s\n", offset, strerror(errno));
+
+		outf = vmlinux;
+	}
+#endif
+
+	if (opts.use_real_mode) {
+		write_reloc(relocs16.count, outf);
+		for (i = 0; i < relocs16.count; i++)
+			write_reloc(relocs16.offset[i], outf);
+
+		write_reloc(relocs32.count, outf);
 		for (i = 0; i < relocs32.count; i++)
-			write_reloc(relocs32.offset[i], stdout);
+			write_reloc(relocs32.offset[i], outf);
 	} else {
 #if ELF_BITS == 64
 		/* Print a stop */
-		write_reloc(0, stdout);
+		write_reloc(0, outf);
 
 		/* Now print each relocation */
 		for (i = 0; i < relocs64.count; i++)
-			write_reloc(relocs64.offset[i], stdout);
+			write_reloc(relocs64.offset[i], outf);
 #endif
 
 		/* Print a stop */
-		write_reloc(0, stdout);
+		write_reloc(0, outf);
 
 		/* Now print each relocation */
 		for (i = 0; i < relocs32.count; i++)
-			write_reloc(relocs32.offset[i], stdout);
+			write_reloc(relocs32.offset[i], outf);
 	}
 }
 
@@ -1073,5 +1128,5 @@ void process(FILE *fp)
 		return;
 	}
 
-	emit_relocs();
+	emit_relocs(fp);
 }
