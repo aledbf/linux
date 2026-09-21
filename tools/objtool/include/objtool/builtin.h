@@ -34,6 +34,7 @@ struct opts {
 	bool backtrace;
 	bool backup;
 	bool cfi;
+	bool pie;
 	const char *debug_checksum;
 	bool dryrun;
 	bool fineibt;

@@ -4771,11 +4771,22 @@ static int check_abs_references(struct objtool_file *file)
 			continue;
 
 		for_each_reloc(sec->rsec, reloc) {
-			if (arch_absolute_reloc(file->elf, reloc)) {
-				WARN("section %s has absolute relocation at offset 0x%llx",
-				     sec->name, (unsigned long long)reloc_offset(reloc));
-				ret++;
-			}
+			if (!arch_absolute_reloc(file->elf, reloc))
+				continue;
+
+			/*
+			 * --pie: a position-independent kernel fixes up
+			 * pointer-sized absolute relocations at boot from its
+			 * relocation table, only narrower ones cannot hold an
+			 * address outside the top 2GB.  --noabs is for code
+			 * that runs before that fixup and rejects them all.
+			 */
+			if (opts.pie && !opts.noabs && arch_reloc_size(reloc) == 8)
+				continue;
+
+			WARN("section %s has absolute relocation at offset 0x%llx",
+			     sec->name, (unsigned long long)reloc_offset(reloc));
+			ret++;
 		}
 	}
 	return ret;
@@ -4936,7 +4947,7 @@ int check(struct objtool_file *file)
 			goto out;
 	}
 
-	if (opts.noabs)
+	if (opts.noabs || opts.pie)
 		warnings += check_abs_references(file);
 
 	if (opts.orc && nr_insns) {

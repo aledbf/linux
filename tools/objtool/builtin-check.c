@@ -81,6 +81,7 @@ static const struct option check_options[] = {
 	OPT_BOOLEAN(0,		 "noabs", &opts.noabs, "reject absolute references in allocatable sections"),
 	OPT_BOOLEAN('n',	 "noinstr", &opts.noinstr, "validate noinstr rules"),
 	OPT_BOOLEAN(0,		 "orc", &opts.orc, "generate ORC metadata"),
+	OPT_BOOLEAN(0,		 "pie", &opts.pie, "reject relocations a PIE kernel cannot fix up"),
 	OPT_BOOLEAN('r',	 "retpoline", &opts.retpoline, "validate and annotate retpoline usage"),
 	OPT_BOOLEAN(0,		 "rethunk", &opts.rethunk, "validate and annotate rethunk usage"),
 	OPT_BOOLEAN(0,		 "unret", &opts.unret, "validate entry unret placement"),
@@ -194,7 +195,8 @@ static bool opts_valid(void)
 	    opts.sls			||
 	    opts.stackval		||
 	    opts.static_call		||
-	    opts.uaccess) {
+	    opts.uaccess		||
+	    opts.pie) {
 		if (opts.dump_orc) {
 			ERROR("--dump can't be combined with other actions");
 			return false;
