@@ -317,6 +317,65 @@ static bool try_to_convert_to_pvm_mode(struct kvm_vcpu *vcpu)
 }
 
 /*
+ * How many instructions to emulate before going back to vcpu_run() to look at
+ * requests and pending work; the same batch VMX's handle_invalid_guest_state()
+ * uses.
+ */
+#define PVM_NON_PVM_EMULATION_BATCH	130
+
+static int handle_non_pvm_mode(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	unsigned int count = PVM_NON_PVM_EMULATION_BATCH;
+	int ret = 1;
+
+	if (try_to_convert_to_pvm_mode(vcpu))
+		return 1;
+
+	while (pvm->non_pvm_mode && count-- != 0) {
+		if (kvm_test_request(KVM_REQ_EVENT, vcpu))
+			return 1;
+
+		if (try_to_convert_to_pvm_mode(vcpu))
+			return 1;
+
+		ret = kvm_emulate_instruction(vcpu, 0);
+
+		if (!ret)
+			goto out;
+
+		/* don't do mode switch in emulation */
+		if (!is_smod(pvm))
+			goto emulation_error;
+
+		if (vcpu->arch.exception.pending)
+			goto emulation_error;
+
+		if (vcpu->arch.halt_request) {
+			vcpu->arch.halt_request = 0;
+			ret = kvm_emulate_halt_noskip(vcpu);
+			goto out;
+		}
+		/*
+		 * Note, return 1 and not 0, vcpu_run() will invoke
+		 * xfer_to_guest_mode() which will create a proper return
+		 * code.
+		 */
+		if (__xfer_to_guest_mode_work_pending())
+			return 1;
+	}
+
+out:
+	return ret;
+
+emulation_error:
+	vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
+	vcpu->run->internal.suberror = KVM_INTERNAL_ERROR_EMULATION;
+	vcpu->run->internal.ndata = 0;
+	return 0;
+}
+
+/*
  * switch_to_smod() and switch_to_umod() switch the mode (smod/umod) and the
  * CR3.  No vTLB flushing when switching the CR3 per PVM Spec.
  *
@@ -662,6 +721,30 @@ static void pvm_patch_hypercall(struct kvm_vcpu *vcpu, unsigned char *hypercall)
 	hypercall[0] = 0x0F;
 	hypercall[1] = 0x0B;
 	hypercall[2] = 0xCC;
+}
+
+static int pvm_check_emulate_instruction(struct kvm_vcpu *vcpu, int emul_type,
+					 void *insn, int insn_len)
+{
+	return X86EMUL_CONTINUE;
+}
+
+static int pvm_skip_emulated_instruction(struct kvm_vcpu *vcpu)
+{
+	return kvm_emulate_instruction(vcpu, EMULTYPE_SKIP);
+}
+
+static int pvm_check_intercept(struct kvm_vcpu *vcpu,
+			       struct x86_instruction_info *info,
+			       enum x86_intercept_stage stage,
+			       struct x86_exception *exception)
+{
+	/*
+	 * HF_GUEST_MASK is not used even nested pvm is supported. L0 pvm
+	 * might even be unaware the L1 pvm.
+	 */
+	WARN_ON_ONCE(1);
+	return X86EMUL_CONTINUE;
 }
 
 static u64 pvm_get_l2_tsc_offset(struct kvm_vcpu *vcpu)
@@ -1194,6 +1277,15 @@ static void pvm_refresh_apicv_exec_ctrl(struct kvm_vcpu *vcpu)
 static bool pvm_apic_init_signal_blocked(struct kvm_vcpu *vcpu)
 {
 	return false;
+}
+
+static void pvm_update_exception_bitmap(struct kvm_vcpu *vcpu)
+{
+	/* disable direct switch when single step debugging */
+	if (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP)
+		to_pvm(vcpu)->switch_flags |= SWITCH_FLAGS_SINGLE_STEP;
+	else
+		to_pvm(vcpu)->switch_flags &= ~SWITCH_FLAGS_SINGLE_STEP;
 }
 
 static void pvm_unpin_vcpu_struct(struct vcpu_pvm *pvm)
@@ -1994,6 +2086,64 @@ static int handle_exit_syscall(struct kvm_vcpu *vcpu)
 	}
 }
 
+static int handle_exit_debug(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	struct kvm_run *kvm_run = pvm->vcpu.run;
+
+	if (pvm->vcpu.guest_debug &
+	    (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP)) {
+		kvm_run->exit_reason = KVM_EXIT_DEBUG;
+		kvm_run->debug.arch.dr6 = pvm->exit_dr6 | DR6_FIXED_1 | DR6_RTM;
+		kvm_run->debug.arch.dr7 = vcpu->arch.guest_debug_dr7;
+		kvm_run->debug.arch.pc = kvm_rip_read(vcpu);
+		kvm_run->debug.arch.exception = DB_VECTOR;
+		return 0;
+	}
+
+	kvm_queue_exception_p(vcpu, DB_VECTOR, pvm->exit_dr6);
+	return 1;
+}
+
+/* check if the previous instruction is "int3" on receiving #BP */
+static bool is_bp_trap(struct kvm_vcpu *vcpu)
+{
+	u8 byte = 0;
+	unsigned long rip;
+	struct x86_exception exception;
+	int r;
+
+	rip = kvm_rip_read(vcpu) - 1;
+	r = kvm_read_guest_virt(vcpu, rip, &byte, 1, &exception);
+
+	/* Just assume it to be int3 when failed to fetch the instruction. */
+	if (r)
+		return true;
+
+	return byte == 0xcc;
+}
+
+static int handle_exit_breakpoint(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	struct kvm_run *kvm_run = pvm->vcpu.run;
+
+	/*
+	 * Breakpoint exception can be caused by int3 or int 3.  While "int3"
+	 * participates in guest debug, but "int 3" should not.
+	 */
+	if ((vcpu->guest_debug & KVM_GUESTDBG_USE_SW_BP) && is_bp_trap(vcpu)) {
+		kvm_rip_write(vcpu, kvm_rip_read(vcpu) - 1);
+		kvm_run->exit_reason = KVM_EXIT_DEBUG;
+		kvm_run->debug.arch.pc = kvm_rip_read(vcpu);
+		kvm_run->debug.arch.exception = BP_VECTOR;
+		return 0;
+	}
+
+	kvm_queue_exception(vcpu, BP_VECTOR);
+	return 1;
+}
+
 /*
  * The PVM ABI leaves, answered here rather than from the CPUID table the VMM
  * configured.  What a guest reads from them decides whether it binds itself to
@@ -2026,6 +2176,170 @@ static bool pvm_get_fixed_cpuid(struct kvm_vcpu *vcpu, u32 function,
 	}
 }
 
+static void pvm_handle_cpuid(struct kvm_vcpu *vcpu)
+{
+	u32 eax, ebx, ecx, edx;
+
+	eax = kvm_rax_read(vcpu);
+	ecx = kvm_rcx_read(vcpu);
+	kvm_cpuid(vcpu, &eax, &ebx, &ecx, &edx, false);
+	kvm_rax_write_raw(vcpu, eax);
+	kvm_rbx_write_raw(vcpu, ebx);
+	kvm_rcx_write_raw(vcpu, ecx);
+	kvm_rdx_write_raw(vcpu, edx);
+}
+
+static bool handle_synthetic_instruction_pvm_cpuid(struct kvm_vcpu *vcpu)
+{
+	/* invlpg 0xffffffffff4d5650; cpuid; */
+	static const char pvm_synthetic_cpuid_insns[] = { PVM_SYNTHETIC_CPUID };
+	char insns[10];
+	struct x86_exception e;
+
+	if (kvm_read_guest_virt(vcpu, kvm_get_linear_rip(vcpu),
+				insns, sizeof(insns), &e) == 0 &&
+	    memcmp(insns, pvm_synthetic_cpuid_insns, sizeof(insns)) == 0) {
+		pvm_handle_cpuid(vcpu);
+		kvm_rip_write(vcpu, kvm_rip_read(vcpu) + sizeof(insns));
+		return true;
+	}
+
+	return false;
+}
+
+static int handle_exit_exception(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	struct kvm_run *kvm_run = vcpu->run;
+	u32 vector, error_code;
+	int err;
+
+	vector = pvm->exit_vector;
+	error_code = pvm->exit_error_code;
+
+	switch (vector) {
+	/*
+	 * #PF, #GP, #UD, #DB and #BP may be the guest's, or the hypervisor's
+	 * for emulation or debugging.
+	 */
+	case PF_VECTOR:
+		/*
+		 * The hardware sets PFERR_USER_MASK for supervisor mode too,
+		 * because the guest runs at CPL3.
+		 */
+		if (is_smod(pvm))
+			error_code &= ~PFERR_USER_MASK;
+
+		/*
+		 * A protection-key fault the guest never asked for: it reached
+		 * WRPKRU anyway -- it runs at CPL 3 under the host's CR4.PKE,
+		 * so it can, whatever CPUID told it -- and the fault means
+		 * nothing architecturally.  Re-enter and let
+		 * pvm_load_guest_xsave_state() put PKRU back to 0 on the way
+		 * in; nothing here has to, and nothing here can, since PKRU is
+		 * the host's again by the time this runs.
+		 *
+		 * One the guest did ask for goes to kvm_handle_page_fault()
+		 * with every other #PF.  The walk there reaches the same
+		 * verdict the hardware did -- vcpu->arch.pkru is the guest's
+		 * PKRU as of this exit, and the guest PTE carries the key that
+		 * the shadow MMU copied into the SPTE -- and injects it.
+		 */
+		if (cpu_feature_enabled(X86_FEATURE_PKU) &&
+		    (error_code & PFERR_PK_MASK)) {
+			if (!pvm_guest_uses_pku(vcpu))
+				return 1;
+
+			/*
+			 * The MMU derives this bit itself, from the key in the
+			 * guest PTE and vcpu->arch.pkru, and WARNs if it is
+			 * handed one that already has it set.  The hardware's
+			 * is the same verdict reached earlier, so drop it and
+			 * let the walk reach it again.
+			 */
+			error_code &= ~PFERR_PK_MASK;
+		}
+
+		return kvm_handle_page_fault(vcpu, error_code, pvm->exit_cr2,
+					     NULL, 0);
+	case GP_VECTOR:
+		if (is_smod(pvm) && handle_synthetic_instruction_pvm_cpuid(vcpu))
+			return 1;
+
+		err = kvm_emulate_instruction(vcpu, EMULTYPE_TRAP_GP);
+		if (!err)
+			return 0;
+
+		if (vcpu->arch.halt_request) {
+			vcpu->arch.halt_request = 0;
+			return kvm_emulate_halt_noskip(vcpu);
+		}
+		return 1;
+	case UD_VECTOR:
+		if (!is_smod(pvm)) {
+			kvm_queue_exception(vcpu, UD_VECTOR);
+			return 1;
+		}
+		return handle_ud(vcpu);
+	case DB_VECTOR:
+		return handle_exit_debug(vcpu);
+	case BP_VECTOR:
+		return handle_exit_breakpoint(vcpu);
+
+	/* Exceptions that are purely the guest's. */
+	case DE_VECTOR:
+	case OF_VECTOR:
+	case BR_VECTOR:
+	case NM_VECTOR:
+	case MF_VECTOR:
+	case XM_VECTOR:
+		kvm_queue_exception(vcpu, vector);
+		return 1;
+	case AC_VECTOR:
+	case TS_VECTOR:
+	case NP_VECTOR:
+	case SS_VECTOR:
+		kvm_queue_exception_e(vcpu, vector, error_code);
+		return 1;
+
+	/*
+	 * The host's own: the NMI was handled by pvm_vcpu_run_noinstr() and
+	 * the #MC by pvm_handle_exit_irqoff(), both before interrupts were
+	 * enabled.
+	 */
+	case NMI_VECTOR:
+	case MC_VECTOR:
+		return 1;
+	default:
+		/*
+		 * #DF is fatal in the host's own handler and never gets here;
+		 * #VE and #VC cannot occur because PVM refuses to load on a TDX
+		 * or SEV-ES host.  Anything else is a host bug.
+		 */
+		vcpu_unimpl(vcpu, "unexpected exception exit %u, error code %#x\n",
+			    vector, error_code);
+		kvm_run->exit_reason = KVM_EXIT_EXCEPTION;
+		kvm_run->ex.exception = vector;
+		kvm_run->ex.error_code = error_code;
+		return 0;
+	}
+}
+
+static int handle_exit_external_interrupt(struct kvm_vcpu *vcpu)
+{
+	++vcpu->stat.irq_exits;
+	return 1;
+}
+
+static int handle_exit_failed_vmentry(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	u32 error_code = pvm->exit_error_code;
+
+	kvm_queue_exception_e(vcpu, GP_VECTOR, error_code);
+	return 1;
+}
+
 /*
  * The guest has exited.  See if we can fix it or if we need userspace
  * assistance.
@@ -2050,6 +2364,9 @@ static int pvm_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 		return 0;
 	}
 
+	if (unlikely(pvm->non_pvm_mode))
+		return handle_non_pvm_mode(vcpu);
+
 	/*
 	 * The guest may have written the PVCS while it ran.  Here rather than
 	 * in pvm_vcpu_run(), which runs outside kvm->srcu.
@@ -2059,6 +2376,16 @@ static int pvm_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 
 	if (exit_reason == PVM_SYSCALL_VECTOR)
 		return handle_exit_syscall(vcpu);
+	if (exit_reason < FIRST_EXTERNAL_VECTOR)
+		return handle_exit_exception(vcpu);
+	if (exit_reason == IA32_SYSCALL_VECTOR) {
+		do_pvm_event(vcpu, IA32_SYSCALL_VECTOR, false, 0);
+		return 1;
+	}
+	if (exit_reason < NR_VECTORS)
+		return handle_exit_external_interrupt(vcpu);
+	if (exit_reason == PVM_FAILED_VMENTRY_VECTOR)
+		return handle_exit_failed_vmentry(vcpu);
 
 	vcpu_unimpl(vcpu, "unexpected exit reason 0x%x\n", exit_reason);
 	vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
@@ -2068,6 +2395,99 @@ static int pvm_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
 	vcpu->run->internal.data[0] = exit_reason;
 	vcpu->run->internal.data[1] = vcpu->arch.last_vmentry_cpu;
 	return 0;
+}
+
+/*
+ * Which hypercall it was.  "HYPERCALL" on its own says almost nothing about
+ * what a guest is spending its exits on -- a TLB flush and a page-table load
+ * cost very different amounts -- so each known hypercall has its own reason.
+ */
+static u32 pvm_get_hypercall_exit_reason(struct kvm_vcpu *vcpu)
+{
+	switch (kvm_rax_read(vcpu)) {
+	case PVM_HC_IRQ_WIN:
+		return PVM_EXIT_REASONS_HC_IRQ_WIN;
+	case PVM_HC_IRQ_HLT:
+		return PVM_EXIT_REASONS_HC_IRQ_HALT;
+	case PVM_HC_LOAD_PGTBL:
+		return PVM_EXIT_REASONS_HC_LOAD_PGTBL;
+	case PVM_HC_TLB_FLUSH:
+		return PVM_EXIT_REASONS_HC_TLB_FLUSH;
+	case PVM_HC_TLB_FLUSH_CURRENT:
+		return PVM_EXIT_REASONS_HC_TLB_FLUSH_CURRENT;
+	case PVM_HC_TLB_INVLPG:
+		return PVM_EXIT_REASONS_HC_TLB_INVLPG;
+	case PVM_HC_LOAD_GS:
+		return PVM_EXIT_REASONS_HC_LOAD_GS;
+	case PVM_HC_RDMSR:
+		return PVM_EXIT_REASONS_HC_RDMSR;
+	case PVM_HC_WRMSR:
+		return PVM_EXIT_REASONS_HC_WRMSR;
+	case PVM_HC_LOAD_TLS:
+		return PVM_EXIT_REASONS_HC_LOAD_TLS;
+	default:
+		return PVM_EXIT_REASONS_HYPERCALL;
+	}
+}
+
+static u32 pvm_get_syscall_exit_reason(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	unsigned long rip = kvm_rip_read(vcpu);
+
+	if (is_smod(pvm)) {
+		if (rip == pvm->msr_retu_rip_plus2)
+			return PVM_EXIT_REASONS_ERETU;
+		else
+			return pvm_get_hypercall_exit_reason(vcpu);
+	}
+
+	return PVM_EXIT_REASONS_SYSCALL;
+}
+
+static void pvm_get_exit_info(struct kvm_vcpu *vcpu, u32 *reason, u64 *info1, u64 *info2,
+			      u32 *intr_info, u32 *error_code)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	if (pvm->exit_vector == PVM_SYSCALL_VECTOR)
+		*reason = pvm_get_syscall_exit_reason(vcpu);
+	else if (pvm->exit_vector == PVM_FAILED_VMENTRY_VECTOR)
+		*reason = PVM_EXIT_REASONS_FAILED_VMENTRY;
+	else if (pvm->exit_vector == IA32_SYSCALL_VECTOR)
+		*reason = PVM_EXIT_REASONS_INT80;
+	else if (pvm->exit_vector >= FIRST_EXTERNAL_VECTOR &&
+		 pvm->exit_vector < NR_VECTORS)
+		*reason = PVM_EXIT_REASONS_INTERRUPT;
+	else
+		*reason = pvm->exit_vector;
+	*info1 = pvm->exit_vector;
+	*info2 = pvm->exit_error_code;
+	*intr_info = pvm->exit_vector;
+	*error_code = pvm->exit_error_code;
+}
+
+/*
+ * PVM delivers events by writing the PVCS and moving the guest's RIP, rather
+ * than arming something the CPU consumes on entry, so by the time anyone asks
+ * there is no pending entry event to report.
+ */
+static void pvm_get_entry_info(struct kvm_vcpu *vcpu, u32 *intr_info, u32 *error_code)
+{
+	*intr_info = 0;
+	*error_code = 0;
+}
+
+static void pvm_handle_exit_irqoff(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	u32 vector = pvm->exit_vector;
+
+	if (vector >= FIRST_EXTERNAL_VECTOR && vector < NR_VECTORS &&
+	    vector != IA32_SYSCALL_VECTOR)
+		x86_entry_from_kvm(EVENT_TYPE_EXTINT, vector);
+	else if (vector == MC_VECTOR)
+		kvm_machine_check();
 }
 
 static bool pvm_has_emulated_msr(struct kvm *kvm, u32 index)
@@ -2096,6 +2516,72 @@ static bool pvm_has_emulated_msr(struct kvm *kvm, u32 index)
 static bool cpu_has_pvm_wbinvd_exit(void)
 {
 	return true;
+}
+
+static void pvm_sync_dirty_debug_regs(struct kvm_vcpu *vcpu)
+{
+	WARN_ONCE(1, "pvm never sets KVM_DEBUGREG_WONT_EXIT\n");
+}
+
+static void pvm_set_dr7(struct kvm_vcpu *vcpu, unsigned long val)
+{
+	to_pvm(vcpu)->guest_dr7 = val;
+}
+
+static __always_inline unsigned long __dr7_enable_mask(int drnum)
+{
+	unsigned long bp_mask = 0;
+
+	bp_mask |= (DR_LOCAL_ENABLE << (drnum * DR_ENABLE_SIZE));
+	bp_mask |= (DR_GLOBAL_ENABLE << (drnum * DR_ENABLE_SIZE));
+
+	return bp_mask;
+}
+
+static __always_inline unsigned long __dr7_mask(int drnum)
+{
+	unsigned long bp_mask = 0xf;
+
+	bp_mask <<= (DR_CONTROL_SHIFT + drnum * DR_CONTROL_SIZE);
+	bp_mask |= __dr7_enable_mask(drnum);
+
+	return bp_mask;
+}
+
+/*
+ * Calculate the correct dr7 for the hardware to avoid the host
+ * being watched.
+ *
+ * It only needs to be calculated each time when vcpu->arch.eff_db or
+ * pvm->guest_dr7 is changed.  But now it is calculated each time on
+ * VM-enter since there is no proper callback for vcpu->arch.eff_db and
+ * it is slow path.
+ */
+static __always_inline unsigned long pvm_eff_dr7(struct kvm_vcpu *vcpu)
+{
+	unsigned long eff_dr7 = to_pvm(vcpu)->guest_dr7;
+	int i;
+
+	/*
+	 * DR7_GD should not be set to hardware. And it doesn't need to be
+	 * set to hardware since PVM guest is running on hardware ring3.
+	 * All access to debug registers will be trapped and the emulation
+	 * code can handle DR7_GD correctly for PVM.
+	 */
+	eff_dr7 &= ~DR7_GD;
+
+	/*
+	 * Disallow addresses that are not for the guest, especially addresses
+	 * on the host entry code.
+	 */
+	for (i = 0; i < KVM_NR_DB_REGS; i++) {
+		if (!pvm_guest_allowed_va(vcpu, vcpu->arch.eff_db[i]))
+			eff_dr7 &= ~__dr7_mask(i);
+		if (!pvm_guest_allowed_va(vcpu, vcpu->arch.eff_db[i] + 7))
+			eff_dr7 &= ~__dr7_mask(i);
+	}
+
+	return eff_dr7;
 }
 
 static int pvm_vcpu_create(struct kvm_vcpu *vcpu)
@@ -2499,6 +2985,7 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.vcpu_load = pvm_vcpu_load,
 	.vcpu_put = pvm_vcpu_put,
 
+	.update_exception_bitmap = pvm_update_exception_bitmap,
 	.get_feature_msr = pvm_get_feature_msr,
 	.get_msr = pvm_get_msr,
 	.set_msr = pvm_set_msr,
@@ -2519,6 +3006,8 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.set_gdt = pvm_set_gdt,
 	.get_idt = pvm_get_idt,
 	.set_idt = pvm_set_idt,
+	.set_dr7 = pvm_set_dr7,
+	.sync_dirty_debug_regs = pvm_sync_dirty_debug_regs,
 	.cache_reg = pvm_cache_reg,
 	.get_rflags = pvm_get_rflags,
 	.set_rflags = pvm_set_rflags,
@@ -2530,6 +3019,7 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.flush_tlb_guest = pvm_flush_hwtlb,
 
 	.handle_exit = pvm_handle_exit,
+	.skip_emulated_instruction = pvm_skip_emulated_instruction,
 	.set_interrupt_shadow = pvm_set_interrupt_shadow,
 	.get_interrupt_shadow = pvm_get_interrupt_shadow,
 	.patch_hypercall = pvm_patch_hypercall,
@@ -2546,12 +3036,18 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.refresh_apicv_exec_ctrl = pvm_refresh_apicv_exec_ctrl,
 	.deliver_interrupt = pvm_deliver_interrupt,
 
+	.get_exit_info = pvm_get_exit_info,
+	.get_entry_info = pvm_get_entry_info,
+
 	.vcpu_after_set_cpuid = pvm_vcpu_after_set_cpuid,
 	.get_fixed_cpuid = pvm_get_fixed_cpuid,
 
 	.recalc_intercepts = pvm_recalc_intercepts,
 
 	.pi_update_irte = pvm_pi_update_irte,
+
+	.check_intercept = pvm_check_intercept,
+	.handle_exit_irqoff = pvm_handle_exit_irqoff,
 
 	.setup_mce = pvm_setup_mce,
 
@@ -2570,6 +3066,7 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.get_l2_tsc_multiplier = pvm_get_l2_tsc_multiplier,
 	.write_tsc_offset = pvm_write_tsc_offset,
 	.write_tsc_multiplier = pvm_write_tsc_multiplier,
+	.check_emulate_instruction = pvm_check_emulate_instruction,
 	.disallowed_va = pvm_disallowed_va,
 	.reload_pinned_pages = pvm_reload_pinned_pages,
 };
