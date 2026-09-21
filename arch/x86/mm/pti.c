@@ -86,6 +86,17 @@ void __init pti_check_boottime_disable(void)
 		return;
 	}
 
+	/*
+	 * The hypervisor runs guest user mode on shadow page tables that do not
+	 * map what the guest kernel marks supervisor-only, which isolates the
+	 * guest kernel from its user space the way PTI would.
+	 */
+	if (cpu_feature_enabled(X86_FEATURE_KVM_PVM_GUEST)) {
+		pti_mode = PTI_FORCE_OFF;
+		pti_print_if_insecure("disabled on PVM guest.");
+		return;
+	}
+
 	if (pti_mode == PTI_AUTO &&
 	    !cpu_attack_vector_mitigated(CPU_MITIGATE_USER_KERNEL))
 		pti_mode = PTI_FORCE_OFF;

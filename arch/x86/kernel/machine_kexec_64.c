@@ -347,6 +347,14 @@ int machine_kexec_prepare(struct kimage *image)
 	unsigned long reloc_end = (unsigned long)__relocate_kernel_end;
 	int result;
 
+	/*
+	 * A PVM guest kernel runs at CPL3: relocate_kernel() and the purgatory
+	 * cannot load CR3, CR4 or the descriptor tables, and the hypervisor
+	 * would keep delivering events to this kernel's entry points.
+	 */
+	if (cpu_feature_enabled(X86_FEATURE_KVM_PVM_GUEST))
+		return -EOPNOTSUPP;
+
 	/* Setup the identity mapped 64bit page table */
 	result = init_pgtable(image, __pa(control_page));
 	if (result)
