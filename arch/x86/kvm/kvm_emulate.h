@@ -245,6 +245,8 @@ struct x86_emulate_ops {
 	void (*triple_fault)(struct x86_emulate_ctxt *ctxt);
 	int (*get_xcr)(struct x86_emulate_ctxt *ctxt, u32 index, u64 *xcr);
 	int (*set_xcr)(struct x86_emulate_ctxt *ctxt, u32 index, u64 xcr);
+	u32 (*get_pkru)(struct x86_emulate_ctxt *ctxt);
+	void (*set_pkru)(struct x86_emulate_ctxt *ctxt, u32 pkru);
 
 	gva_t (*get_untagged_addr)(struct x86_emulate_ctxt *ctxt, gva_t addr,
 				   unsigned int flags);

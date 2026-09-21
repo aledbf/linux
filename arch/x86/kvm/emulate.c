@@ -3798,6 +3798,45 @@ static int em_xsetbv(struct x86_emulate_ctxt *ctxt)
 	return X86EMUL_CONTINUE;
 }
 
+/*
+ * RDPKRU and WRPKRU (0f 01 ee / 0f 01 ef) run without exiting on VMX and SVM,
+ * so they only get here through the forced emulation prefix.  Both are #UD
+ * without CR4.PKE, and both encodings are NP: a 66, F2 or F3 prefix is #UD.
+ */
+static bool pkru_insn_invalid(struct x86_emulate_ctxt *ctxt)
+{
+	return ctxt->op_prefix || ctxt->rep_prefix ||
+	       !(ctxt->ops->get_cr(ctxt, 4) & X86_CR4_PKE);
+}
+
+static int em_rdpkru(struct x86_emulate_ctxt *ctxt)
+{
+	if (pkru_insn_invalid(ctxt))
+		return emulate_ud(ctxt);
+
+	/* Only ECX is checked, the upper half of RCX is ignored. */
+	if ((u32)reg_read(ctxt, VCPU_REGS_RCX))
+		return emulate_gp(ctxt, 0);
+
+	*reg_write(ctxt, VCPU_REGS_RAX) = ctxt->ops->get_pkru(ctxt);
+	*reg_write(ctxt, VCPU_REGS_RDX) = 0;
+	return X86EMUL_CONTINUE;
+}
+
+static int em_wrpkru(struct x86_emulate_ctxt *ctxt)
+{
+	if (pkru_insn_invalid(ctxt))
+		return emulate_ud(ctxt);
+
+	/* Only ECX and EDX are checked, as for RDPKRU. */
+	if ((u32)reg_read(ctxt, VCPU_REGS_RCX) ||
+	    (u32)reg_read(ctxt, VCPU_REGS_RDX))
+		return emulate_gp(ctxt, 0);
+
+	ctxt->ops->set_pkru(ctxt, (u32)reg_read(ctxt, VCPU_REGS_RAX));
+	return X86EMUL_CONTINUE;
+}
+
 static bool valid_cr(int nr)
 {
 	switch (nr) {
@@ -4004,6 +4043,12 @@ static const struct opcode group7_rm3[] = {
 	DIP(SrcNone | Prot | Priv,		invlpga,	check_svme),
 };
 
+static const struct opcode group7_rm5[] = {
+	N, N, N, N, N, N,
+	I(ImplicitOps, em_rdpkru),
+	I(ImplicitOps, em_wrpkru),
+};
+
 static const struct opcode group7_rm7[] = {
 	N,
 	DIP(SrcNone, rdtscp, check_rdtsc),
@@ -4084,7 +4129,8 @@ static const struct group_dual group7 = { {
 	EXT(0, group7_rm1),
 	EXT(0, group7_rm2),
 	EXT(0, group7_rm3),
-	II(SrcNone | DstMem | Mov,		em_smsw, smsw), N,
+	II(SrcNone | DstMem | Mov,		em_smsw, smsw),
+	EXT(0, group7_rm5),
 	II(SrcMem16 | Mov | Priv,		em_lmsw, lmsw),
 	EXT(0, group7_rm7),
 } };

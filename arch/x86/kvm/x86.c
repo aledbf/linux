@@ -5782,6 +5782,16 @@ static int emulator_set_xcr(struct x86_emulate_ctxt *ctxt, u32 index, u64 xcr)
 	return __kvm_set_xcr(emul_to_vcpu(ctxt), index, xcr);
 }
 
+static u32 emulator_get_pkru(struct x86_emulate_ctxt *ctxt)
+{
+	return emul_to_vcpu(ctxt)->arch.pkru;
+}
+
+static void emulator_set_pkru(struct x86_emulate_ctxt *ctxt, u32 pkru)
+{
+	emul_to_vcpu(ctxt)->arch.pkru = pkru;
+}
+
 static void emulator_vm_bugged(struct x86_emulate_ctxt *ctxt)
 {
 	struct kvm *kvm = emul_to_vcpu(ctxt)->kvm;
@@ -5858,6 +5868,8 @@ static const struct x86_emulate_ops emulate_ops = {
 	.triple_fault        = emulator_triple_fault,
 	.get_xcr             = emulator_get_xcr,
 	.set_xcr             = emulator_set_xcr,
+	.get_pkru            = emulator_get_pkru,
+	.set_pkru            = emulator_set_pkru,
 	.get_untagged_addr   = emulator_get_untagged_addr,
 	.is_canonical_addr   = emulator_is_canonical_addr,
 	.page_address_valid  = emulator_page_address_valid,
