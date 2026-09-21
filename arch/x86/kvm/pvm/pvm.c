@@ -654,6 +654,16 @@ static void pvm_vcpu_put(struct kvm_vcpu *vcpu)
 	pvm_prepare_switch_to_host(pvm);
 }
 
+static void pvm_patch_hypercall(struct kvm_vcpu *vcpu, unsigned char *hypercall)
+{
+	/* KVM_X86_QUIRK_FIX_HYPERCALL_INSN should not be enabled for pvm guest */
+
+	/* ud2; int3; */
+	hypercall[0] = 0x0F;
+	hypercall[1] = 0x0B;
+	hypercall[2] = 0xCC;
+}
+
 static u64 pvm_get_l2_tsc_offset(struct kvm_vcpu *vcpu)
 {
 	return 0;
@@ -1598,6 +1608,468 @@ static void pvm_setup_mce(struct kvm_vcpu *vcpu)
 {
 }
 
+static int handle_synthetic_instruction_return_user(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	struct pvm_vcpu_struct *pvcs;
+	unsigned long rflags;
+	u32 pending_async_exceptions;
+
+	/* switch to user mode before rsp changed. */
+	switch_to_umod(vcpu);
+
+	pvcs = pvm->pvcs;
+	if (!pvcs) {
+		kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+		return 1;
+	}
+
+	pending_async_exceptions = pvcs->event_vector;
+	pvcs->event_vector = PVM_PVCS_EVENT_VECTOR_STD;
+
+	kvm_rip_write(vcpu, pvcs->rip);
+	kvm_rcx_write_raw(vcpu, pvcs->rcx);
+	kvm_r11_write_raw(vcpu, pvcs->r11);
+	rflags = pvcs->eflags;
+
+	pvm->hw_cs = pvcs->user_cs | USER_RPL;
+	pvm->hw_ss = pvcs->user_ss | USER_RPL;
+	pvm_write_guest_gs_base(pvm, pvcs->user_gsbase);
+	/* The switcher's half of this is SWITCHER_PKRU_TO_UMOD. */
+	if (pvm_guest_uses_pku(vcpu))
+		vcpu->arch.pkru = pvcs->pkru;
+
+	pvm_mark_pvcs_dirty(pvm);
+
+	/*
+	 * Through kvm_set_rflags() rather than pvm->rflags, so that guest
+	 * debugging, PVCS::event_flags and the switch flags follow.
+	 */
+	kvm_set_rflags(vcpu, rflags);
+
+	if (pending_async_exceptions & PVM_PVCS_EVENT_VECTOR_MCE)
+		do_pvm_event(vcpu, MC_VECTOR, false, 0);
+	if (pending_async_exceptions & PVM_PVCS_EVENT_VECTOR_NMI)
+		do_pvm_event(vcpu, NMI_VECTOR, false, 0);
+
+	return 1;
+}
+
+static int handle_hc_irq_window(struct kvm_vcpu *vcpu)
+{
+	kvm_make_request(KVM_REQ_EVENT, vcpu);
+	to_pvm(vcpu)->switch_flags &= ~SWITCH_FLAGS_IRQ_WIN;
+	pvm_event_flags_update(vcpu, 0, PVM_EVENT_FLAGS_IP);
+
+	++vcpu->stat.irq_window_exits;
+	return 1;
+}
+
+static int handle_hc_irq_halt(struct kvm_vcpu *vcpu)
+{
+	kvm_set_rflags(vcpu, kvm_get_rflags(vcpu) | X86_EFLAGS_IF);
+
+	return kvm_emulate_halt_noskip(vcpu);
+}
+
+/*
+ * Hypercall: PVM_HC_LOAD_PGTBL
+ *	Load two PGDs into the current CR3.
+ *
+ * Arguments:
+ *	flags:	bit0: flush the TLBs tagged with current PCID.
+ *		bit1: 4 (bit1=0) or 5 (bit1=1 && cpuid_has(LA57)) level paging.
+ *	pgd: to be loaded into CR3.
+ */
+static int handle_hc_load_pagetables(struct kvm_vcpu *vcpu, unsigned long flags,
+				     unsigned long pgd)
+{
+	unsigned long old_cr4 = vcpu->arch.cr4;
+	unsigned long cr4 = old_cr4;
+
+	/*
+	 * Unlike MOV to CR4, the paging level may change here, together with
+	 * CR3.  LA57 is the only bit that changes, only where the guest's CPUID
+	 * has it, and it is not one of the bits kvm_update_cpuid_runtime()
+	 * follows, so there is nothing else to validate or update.
+	 */
+	if (!(flags & PVM_LOAD_PGTBL_FLAGS_LA57))
+		cr4 &= ~X86_CR4_LA57;
+	else if (guest_cpu_cap_has(vcpu, X86_FEATURE_LA57))
+		cr4 |= X86_CR4_LA57;
+
+	if (cr4 != old_cr4) {
+		vcpu->arch.cr4 = cr4;
+		kvm_mmu_reset_context(vcpu);
+	}
+
+	/*
+	 * A CR3 KVM refuses -- reserved bits, a GPA beyond the guest's, or
+	 * NOFLUSH without CR4.PCIDE -- is what MOV to CR3 answers with #GP, so
+	 * do the same, with the paging level left as it was, rather than
+	 * return to a guest that believes it switched address space and did
+	 * not.
+	 */
+	if (kvm_set_cr3(vcpu, (flags & PVM_LOAD_PGTBL_FLAGS_TLB) ?
+			      pgd : pgd | CR3_NOFLUSH)) {
+		if (cr4 != old_cr4) {
+			vcpu->arch.cr4 = old_cr4;
+			kvm_mmu_reset_context(vcpu);
+		}
+		kvm_inject_gp(vcpu, 0);
+		return 1;
+	}
+
+	if (cr4 != old_cr4)
+		kvm_make_request(KVM_REQ_TLB_FLUSH_GUEST, vcpu);
+
+	return 1;
+}
+
+/*
+ * Hypercall: PVM_HC_TLB_FLUSH
+ *	Flush all TLBs.
+ */
+static int handle_hc_flush_tlb_all(struct kvm_vcpu *vcpu)
+{
+	kvm_make_request(KVM_REQ_TLB_FLUSH_GUEST, vcpu);
+
+	return 1;
+}
+
+/*
+ * Hypercall: PVM_HC_TLB_FLUSH_CURRENT
+ *	Flush all TLBs tagged with the current PCID.
+ */
+static int handle_hc_flush_tlb_current(struct kvm_vcpu *vcpu)
+{
+	kvm_set_cr3(vcpu, vcpu->arch.cr3);
+
+	return 1;
+}
+
+/*
+ * Hypercall: PVM_HC_TLB_INVLPG
+ *	Flush TLBs associated with a single address for all tags.
+ */
+static int handle_hc_invlpg(struct kvm_vcpu *vcpu, unsigned long addr)
+{
+	kvm_mmu_invlpg(vcpu, addr);
+
+	return 1;
+}
+
+/*
+ * Hypercall: PVM_HC_LOAD_GS
+ *	Load %gs with the selector %rdi and load the resulted base address
+ *	into RAX.
+ *
+ *	If %rdi is an invalid selector (including RPL != 3), NULL selector
+ *	will be used instead.
+ *
+ *	Return the resulted GS BASE in vCPU's RAX.
+ */
+static int handle_hc_load_gs(struct kvm_vcpu *vcpu, unsigned short sel)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	unsigned long guest_kernel_gs_base;
+
+	/* Use NULL selector if RPL != 3. */
+	if (sel != 0 && (sel & 3) != 3)
+		sel = 0;
+
+	/* Protect the guest state on the hardware. */
+	preempt_disable();
+
+	/*
+	 * Switch to the guest state because the CPU is going to set the %gs to
+	 * the guest value.  Save the original guest MSR_GS_BASE if it is
+	 * already the guest state.
+	 */
+	if (!pvm->loaded_cpu_state)
+		pvm_prepare_switch_to_guest(vcpu);
+	else
+		__save_gs_base(pvm);
+
+	/*
+	 * Load sel into %gs, which also changes the hardware MSR_KERNEL_GS_BASE.
+	 *
+	 * Before load_gs_index(sel):
+	 *	hardware %gs:			old gs index
+	 *	hardware MSR_KERNEL_GS_BASE:	guest MSR_GS_BASE
+	 *
+	 * After load_gs_index(sel);
+	 *	hardware %gs:			resulted %gs, @sel or NULL
+	 *	hardware MSR_KERNEL_GS_BASE:	resulted GS BASE
+	 *
+	 * The resulted %gs is the new guest %gs and will be saved into
+	 * pvm->segments[VCPU_SREG_GS].selector later when the CPU is
+	 * switching to host or the guest %gs is read (pvm_get_segment()).
+	 *
+	 * The resulted hardware MSR_KERNEL_GS_BASE will be returned via RAX
+	 * to the guest and the hardware MSR_KERNEL_GS_BASE, which represents
+	 * the guest MSR_GS_BASE when in VM-Exit state, is restored back to
+	 * the guest MSR_GS_BASE.
+	 */
+	load_gs_index(sel);
+
+	/* Get the resulted guest MSR_KERNEL_GS_BASE. */
+	rdmsrq(MSR_KERNEL_GS_BASE, guest_kernel_gs_base);
+
+	/* Restore the guest MSR_GS_BASE into the hardware MSR_KERNEL_GS_BASE. */
+	__load_gs_base(pvm);
+
+	/* Finished access to the guest state on the hardware. */
+	preempt_enable();
+
+	/* Return RAX with the resulted GS BASE. */
+	kvm_rax_write_raw(vcpu, guest_kernel_gs_base);
+
+	return 1;
+}
+
+/*
+ * Hypercall: PVM_HC_RDMSR
+ *	Read MSR.
+ *	Return with RAX = 0 and RDX = the MSR value if succeeded.
+ *	Return with RAX = -KVM_EINVAL and RDX = 0 if it failed.
+ */
+static int handle_hc_rdmsr(struct kvm_vcpu *vcpu, u32 index)
+{
+	u64 value = 0;
+
+	/*
+	 * The guest-initiated accessor, so that the guest's CPUID checks and
+	 * the VMM's MSR filter apply.  kvm:kvm_msr is raised by hand because
+	 * only kvm_emulate_{rd,wr}msr() raise it, and a hypercall does not go
+	 * through them.
+	 */
+	if (kvm_emulate_msr_read(vcpu, index, &value)) {
+		trace_kvm_msr_read_ex(index);
+		kvm_rdx_write_raw(vcpu, 0);
+		kvm_rax_write_raw(vcpu, -KVM_EINVAL);
+		return 1;
+	}
+
+	trace_kvm_msr_read(index, value);
+	kvm_rdx_write_raw(vcpu, value);
+	kvm_rax_write_raw(vcpu, 0);
+
+	return 1;
+}
+
+/*
+ * Hypercall: PVM_HC_WRMSR
+ *	Write MSR.
+ *	Return with RAX = 0 if succeeded.
+ *	Return with RAX = -KVM_EINVAL if it failed.
+ */
+static int handle_hc_wrmsr(struct kvm_vcpu *vcpu, u32 index, u64 value)
+{
+	/* See handle_hc_rdmsr() for the accessor and the tracepoint. */
+	if (kvm_emulate_msr_write(vcpu, index, value)) {
+		trace_kvm_msr_write_ex(index, value);
+		kvm_rax_write_raw(vcpu, -KVM_EINVAL);
+	} else {
+		trace_kvm_msr_write(index, value);
+		kvm_rax_write_raw(vcpu, 0);
+	}
+
+	return 1;
+}
+
+/*
+ * Whether a guest TLS descriptor may go into the host GDT: a present 32-bit
+ * data segment, as tls_desc_okay() in arch/x86/kernel/tls.c checks.
+ */
+static bool pvm_tls_desc_okay(struct desc_struct *desc)
+{
+	return desc->p && !(desc->type & (1 << 3)) && desc->d;
+}
+
+/*
+ * Hypercall: PVM_HC_LOAD_TLS
+ *	Load guest TLS desc into host GDT.
+ */
+static int handle_hc_load_tls(struct kvm_vcpu *vcpu, unsigned long tls_desc_0,
+			      unsigned long tls_desc_1, unsigned long tls_desc_2)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	unsigned long *tls_array = (unsigned long *)&pvm->tls_array[0];
+	int i;
+
+	tls_array[0] = tls_desc_0;
+	tls_array[1] = tls_desc_1;
+	tls_array[2] = tls_desc_2;
+
+	for (i = 0; i < GDT_ENTRY_TLS_ENTRIES; i++) {
+		if (!pvm_tls_desc_okay(&pvm->tls_array[i])) {
+			pvm->tls_array[i] = (struct desc_struct){0};
+			continue;
+		}
+		/* Normalize the descriptor, as fill_ldt() does. */
+		pvm->tls_array[i].type |= 1;
+		pvm->tls_array[i].s = 1;
+		pvm->tls_array[i].dpl = 0x3;
+		pvm->tls_array[i].l = 0;
+	}
+
+	preempt_disable();
+	if (pvm->loaded_cpu_state)
+		host_gdt_set_tls(pvm);
+	preempt_enable();
+
+	return 1;
+}
+
+/*
+ * Like complete_hypercall_exit(), but RIP is already past the SYSCALL
+ * instruction that made the hypercall.
+ */
+static int pvm_complete_hypercall(struct kvm_vcpu *vcpu)
+{
+	u64 ret = vcpu->run->hypercall.ret;
+
+	if (!is_64_bit_hypercall(vcpu))
+		ret = (u32)ret;
+	kvm_rax_write_raw(vcpu, ret);
+	return 1;
+}
+
+static int handle_kvm_hypercall(struct kvm_vcpu *vcpu)
+{
+	int r;
+
+	/* PVM hypercalls pass in R10 what KVM hypercalls pass in RCX. */
+	kvm_rcx_write_raw(vcpu, kvm_r10_read(vcpu));
+	r = __kvm_emulate_hypercall(vcpu, kvm_x86_call(get_cpl)(vcpu),
+				    pvm_complete_hypercall);
+	kvm_r10_write_raw(vcpu, kvm_rcx_read(vcpu));
+
+	return r;
+}
+
+static int handle_exit_syscall(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	unsigned long rip = kvm_rip_read(vcpu);
+	unsigned long a0, a1, a2;
+
+	if (!is_smod(pvm)) {
+		__do_pvm_event(vcpu, true, PVM_SYSCALL_VECTOR, false, 0);
+		return 1;
+	}
+
+	if (rip == pvm->msr_retu_rip_plus2)
+		return handle_synthetic_instruction_return_user(vcpu);
+
+	a0 = kvm_rbx_read(vcpu);
+	a1 = kvm_r10_read(vcpu);
+	a2 = kvm_rdx_read(vcpu);
+
+	/* A PVM hypercall, or else a KVM one. */
+	switch (kvm_rax_read(vcpu)) {
+	case PVM_HC_IRQ_WIN:
+		return handle_hc_irq_window(vcpu);
+	case PVM_HC_IRQ_HLT:
+		return handle_hc_irq_halt(vcpu);
+	case PVM_HC_LOAD_PGTBL:
+		return handle_hc_load_pagetables(vcpu, a0, a1);
+	case PVM_HC_TLB_FLUSH:
+		return handle_hc_flush_tlb_all(vcpu);
+	case PVM_HC_TLB_FLUSH_CURRENT:
+		return handle_hc_flush_tlb_current(vcpu);
+	case PVM_HC_TLB_INVLPG:
+		return handle_hc_invlpg(vcpu, a0);
+	case PVM_HC_LOAD_GS:
+		return handle_hc_load_gs(vcpu, a0);
+	case PVM_HC_RDMSR:
+		return handle_hc_rdmsr(vcpu, a0);
+	case PVM_HC_WRMSR:
+		return handle_hc_wrmsr(vcpu, a0, a1);
+	case PVM_HC_LOAD_TLS:
+		return handle_hc_load_tls(vcpu, a0, a1, a2);
+	default:
+		return handle_kvm_hypercall(vcpu);
+	}
+}
+
+/*
+ * The PVM ABI leaves, answered here rather than from the CPUID table the VMM
+ * configured.  What a guest reads from them decides whether it binds itself to
+ * this ABI at all, so it has to come from the code that implements the ABI --
+ * a VMM that forgot to add the entries, or added the wrong ones, would
+ * otherwise talk a guest into running against a contract nothing keeps.
+ * Hooked into kvm_cpuid(), so the synthetic instruction and a CPUID that is
+ * emulated see the same leaves.
+ */
+static bool pvm_get_fixed_cpuid(struct kvm_vcpu *vcpu, u32 function,
+				u32 *eax, u32 *ebx, u32 *ecx, u32 *edx)
+{
+	static const char sig[12] = PVM_SIGNATURE;
+
+	switch (function) {
+	case PVM_CPUID_SIGNATURE:
+		*eax = PVM_CPUID_MAX;
+		memcpy(ebx, &sig[0], 4);
+		memcpy(ecx, &sig[4], 4);
+		memcpy(edx, &sig[8], 4);
+		return true;
+	case PVM_CPUID_FEATURES:
+		*eax = PVM_ABI_VERSION;
+		*ebx = PVM_FEATURES_SUPPORTED;
+		*ecx = 0;
+		*edx = 0;
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*
+ * The guest has exited.  See if we can fix it or if we need userspace
+ * assistance.
+ */
+static int pvm_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	u32 exit_reason = pvm->exit_vector;
+
+	/*
+	 * A vCPU KVM_SET_TSC_KHZ above the host's frequency is accepted by KVM
+	 * as "catch up in software", which a guest reading the host's TSC
+	 * cannot do (see pvm_write_tsc_offset()).  One below it is refused
+	 * outright.
+	 */
+	if (unlikely(vcpu->arch.tsc_always_catchup)) {
+		vcpu_unimpl(vcpu, "TSC frequency %u kHz is not the host's %u kHz\n",
+			    vcpu->arch.virtual_tsc_khz, tsc_khz);
+		vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
+		vcpu->run->internal.suberror = KVM_INTERNAL_ERROR_EMULATION;
+		vcpu->run->internal.ndata = 0;
+		return 0;
+	}
+
+	/*
+	 * The guest may have written the PVCS while it ran.  Here rather than
+	 * in pvm_vcpu_run(), which runs outside kvm->srcu.
+	 */
+	if (likely(pvm->pvcs))
+		pvm_mark_pvcs_dirty(pvm);
+
+	if (exit_reason == PVM_SYSCALL_VECTOR)
+		return handle_exit_syscall(vcpu);
+
+	vcpu_unimpl(vcpu, "unexpected exit reason 0x%x\n", exit_reason);
+	vcpu->run->exit_reason = KVM_EXIT_INTERNAL_ERROR;
+	vcpu->run->internal.suberror =
+		KVM_INTERNAL_ERROR_UNEXPECTED_EXIT_REASON;
+	vcpu->run->internal.ndata = 2;
+	vcpu->run->internal.data[0] = exit_reason;
+	vcpu->run->internal.data[1] = vcpu->arch.last_vmentry_cpu;
+	return 0;
+}
+
 static bool pvm_has_emulated_msr(struct kvm *kvm, u32 index)
 {
 	switch (index) {
@@ -1650,6 +2122,10 @@ static void pvm_vcpu_free(struct kvm_vcpu *vcpu)
 	struct vcpu_pvm *pvm = to_pvm(vcpu);
 
 	pvm_unpin_vcpu_struct(pvm);
+}
+
+static void pvm_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
+{
 }
 
 /*
@@ -2053,8 +2529,10 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.flush_tlb_gva = pvm_flush_hwtlb_gva,
 	.flush_tlb_guest = pvm_flush_hwtlb,
 
+	.handle_exit = pvm_handle_exit,
 	.set_interrupt_shadow = pvm_set_interrupt_shadow,
 	.get_interrupt_shadow = pvm_get_interrupt_shadow,
+	.patch_hypercall = pvm_patch_hypercall,
 	.inject_irq = pvm_inject_irq,
 	.inject_nmi = pvm_inject_nmi,
 	.inject_exception = pvm_inject_exception,
@@ -2067,6 +2545,9 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.enable_irq_window = pvm_enable_irq_window,
 	.refresh_apicv_exec_ctrl = pvm_refresh_apicv_exec_ctrl,
 	.deliver_interrupt = pvm_deliver_interrupt,
+
+	.vcpu_after_set_cpuid = pvm_vcpu_after_set_cpuid,
+	.get_fixed_cpuid = pvm_get_fixed_cpuid,
 
 	.recalc_intercepts = pvm_recalc_intercepts,
 
