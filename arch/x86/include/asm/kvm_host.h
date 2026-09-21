@@ -369,7 +369,15 @@ union kvm_mmu_page_role {
 		 */
 		unsigned cr4_smep:1;
 
-		unsigned:3;
+		/*
+		 * Set only for a guest that runs at hardware CPL3 directly on
+		 * the shadow page tables, with CR4.PKE=1.  The guest's
+		 * protection keys are then copied into the leaf SPTEs, so
+		 * their contents depend on CR4.PKE.
+		 */
+		unsigned cr4_pke:1;
+
+		unsigned:2;
 
 		/*
 		 * This is left at the top of the word so that
@@ -392,7 +400,8 @@ union kvm_mmu_page_role {
  * are for things that either (a) do not affect the validity of the shadow page
  * or (b) are indirectly reflected in the shadow page's role.  For example,
  * CR4.PKE only affects permission checks for software walks of the guest page
- * tables (because KVM doesn't support Protection Keys with shadow paging), and
+ * tables (because KVM doesn't support Protection Keys with shadow paging, except
+ * for a guest running at hardware CPL3, see the page role), and
  * CR0.PG, CR4.PAE, and CR4.PSE are indirectly reflected in role.level.
  *
  * Note, SMAP is not redundant with smap_andnot_wp in the page role.  If

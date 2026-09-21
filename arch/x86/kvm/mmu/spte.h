@@ -25,6 +25,9 @@
  * - bits 56-59: unused
  * - bits 60-61: type of A/D tracking
  * - bits 62 (EPT only): saved XU bit for disabled AD
+ *
+ * For a guest at hardware CPL3 (shadow_guest_cpl3), bits 59-62 of a leaf SPTE
+ * hold the guest's protection key instead; see spte_ad_enabled().
  */
 
 /*
@@ -345,10 +348,15 @@ static inline bool sp_ad_disabled(struct kvm_mmu_page *sp)
 	return sp->role.ad_disabled;
 }
 
+/*
+ * A guest at hardware CPL3 only has legacy shadow SPTEs, which always use A/D
+ * bits, and bits 60-61 of its leaf SPTEs are part of the protection key.
+ */
 static inline bool spte_ad_enabled(u64 spte)
 {
 	KVM_MMU_WARN_ON(!is_shadow_present_pte(spte));
-	return (spte & SPTE_TDP_AD_MASK) != SPTE_TDP_AD_DISABLED;
+	return (spte & SPTE_TDP_AD_MASK) != SPTE_TDP_AD_DISABLED ||
+	       shadow_guest_cpl3;
 }
 
 static inline bool spte_ad_need_write_protect(u64 spte)
@@ -357,9 +365,11 @@ static inline bool spte_ad_need_write_protect(u64 spte)
 	/*
 	 * This is benign for non-TDP SPTEs as SPTE_TDP_AD_ENABLED is '0',
 	 * and non-TDP SPTEs will never set these bits.  Optimize for 64-bit
-	 * TDP and do the A/D type check unconditionally.
+	 * TDP and do the A/D type check unconditionally.  The exception is a
+	 * guest at hardware CPL3, see spte_ad_enabled().
 	 */
-	return (spte & SPTE_TDP_AD_MASK) != SPTE_TDP_AD_ENABLED;
+	return (spte & SPTE_TDP_AD_MASK) != SPTE_TDP_AD_ENABLED &&
+	       !shadow_guest_cpl3;
 }
 
 static inline bool is_access_track_spte(u64 spte)
@@ -588,6 +598,46 @@ static inline void kvm_mmu_check_leaf_spte(u64 spte)
 {
 	KVM_MMU_WARN_ON(shadow_guest_cpl3 && is_shadow_present_pte(spte) &&
 			!(spte & PT_USER_MASK));
+}
+
+/*
+ * A guest that runs at hardware CPL3 directly on the shadow page tables has
+ * its protection keys enforced by the hardware, so the key in the guest PTE
+ * is copied into the leaf SPTE.  role.cr4_pke is set only for such a guest
+ * with CR4.PKE=1; for everyone else the key is checked, if at all, by
+ * permission_fault() on a software walk.
+ *
+ * Applied after make_spte() by the shadow paths that have a guest PTE to
+ * take the key from, rather than threaded through make_spte() and so through
+ * the TDP MMU, which has none.
+ */
+#define SPTE_GUEST_PKEY_SHIFT	_PAGE_BIT_PKEY_BIT0
+#define SPTE_GUEST_PKEY_MASK	GENMASK_ULL(_PAGE_BIT_PKEY_BIT3, _PAGE_BIT_PKEY_BIT0)
+
+/*
+ * The key is where the hardware looks for it, bits 59-62.  That covers the
+ * A/D tracking type, which spte_ad_enabled() and spte_ad_need_write_protect()
+ * therefore ignore for such a guest, and must not cover any bit a present
+ * shadow SPTE uses for something else.
+ */
+static_assert(SPTE_GUEST_PKEY_MASK == GENMASK_ULL(62, 59));
+static_assert((SPTE_GUEST_PKEY_MASK & SPTE_TDP_AD_MASK) == SPTE_TDP_AD_MASK);
+static_assert(!(SPTE_GUEST_PKEY_MASK &
+		(SPTE_MMU_PRESENT_MASK | DEFAULT_SPTE_HOST_WRITABLE |
+		 DEFAULT_SPTE_MMU_WRITABLE | PT64_NX_MASK |
+		 (((1ULL << 52) - 1) & ~(u64)(PAGE_SIZE - 1)))));
+
+static inline u64 spte_set_guest_pkey(struct kvm_mmu_page *sp, u64 spte, u8 pkey)
+{
+	if (!sp->role.cr4_pke)
+		return spte;
+
+	return spte | ((u64)pkey << SPTE_GUEST_PKEY_SHIFT);
+}
+
+static inline u8 spte_guest_pkey(u64 spte)
+{
+	return (spte & SPTE_GUEST_PKEY_MASK) >> SPTE_GUEST_PKEY_SHIFT;
 }
 
 bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,

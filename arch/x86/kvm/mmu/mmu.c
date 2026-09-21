@@ -3165,7 +3165,7 @@ int mmu_try_to_unsync_pages(struct kvm *kvm, const struct kvm_memory_slot *slot,
 }
 
 static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
-			u64 *sptep, unsigned int pte_access, gfn_t gfn,
+			u64 *sptep, unsigned int pte_access, u8 pkey, gfn_t gfn,
 			kvm_pfn_t pfn, struct kvm_page_fault *fault)
 {
 	struct kvm_mmu_page *sp = sptep_to_sp(sptep);
@@ -3215,6 +3215,7 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 
 	wrprot = make_spte(vcpu, sp, slot, pte_access, gfn, pfn, *sptep, prefetch,
 			   false, host_writable, &spte);
+	spte = spte_set_guest_pkey(sp, spte, pkey);
 	kvm_mmu_check_leaf_spte(spte);
 
 	if (*sptep == spte) {
@@ -3242,7 +3243,7 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 }
 
 static bool kvm_mmu_prefetch_sptes(struct kvm_vcpu *vcpu, gfn_t gfn, u64 *sptep,
-				   int nr_pages, unsigned int access)
+				   int nr_pages, unsigned int access, u8 pkey)
 {
 	struct page *pages[PTE_PREFETCH_NUM];
 	struct kvm_memory_slot *slot;
@@ -3260,7 +3261,7 @@ static bool kvm_mmu_prefetch_sptes(struct kvm_vcpu *vcpu, gfn_t gfn, u64 *sptep,
 		return false;
 
 	for (i = 0; i < nr_pages; i++, gfn++, sptep++) {
-		mmu_set_spte(vcpu, slot, sptep, access, gfn,
+		mmu_set_spte(vcpu, slot, sptep, access, pkey, gfn,
 			     page_to_pfn(pages[i]), NULL);
 
 		/*
@@ -3285,7 +3286,7 @@ static bool direct_pte_prefetch_many(struct kvm_vcpu *vcpu,
 	gfn_t gfn = kvm_mmu_page_get_gfn(sp, spte_index(start));
 	unsigned int access = sp->role.access;
 
-	return kvm_mmu_prefetch_sptes(vcpu, gfn, start, end - start, access);
+	return kvm_mmu_prefetch_sptes(vcpu, gfn, start, end - start, access, 0);
 }
 
 static void __direct_pte_prefetch(struct kvm_vcpu *vcpu,
@@ -3607,7 +3608,7 @@ static int direct_map(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
 	if (WARN_ON_ONCE(it.level != fault->goal_level))
 		return -EFAULT;
 
-	ret = mmu_set_spte(vcpu, fault->slot, it.sptep, access,
+	ret = mmu_set_spte(vcpu, fault->slot, it.sptep, access, 0,
 			   base_gfn, fault->pfn, fault);
 	if (ret == RET_PF_SPURIOUS)
 		return ret;
@@ -6134,6 +6135,7 @@ static void init_kvm_shadow_mmu(struct kvm_vcpu *vcpu,
 		}
 		kvm_mmu_role_set_user(&root_role,
 				      kvm_x86_call(get_cpl)(vcpu) != 0);
+		root_role.cr4_pke = cpu_role.ext.cr4_pke;
 	}
 
 	shadow_mmu_init_context(vcpu, context, root_role);

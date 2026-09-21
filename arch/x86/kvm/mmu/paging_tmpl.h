@@ -88,6 +88,7 @@ struct guest_walker {
 	bool pte_writable[PT_MAX_FULL_LEVELS];
 	unsigned int pt_access[PT_MAX_FULL_LEVELS];
 	unsigned int pte_access;
+	u8 pte_pkey;
 	gfn_t gfn;
 	struct x86_exception fault;
 };
@@ -446,6 +447,7 @@ retry_walk:
 	} while (!FNAME(is_last_gpte)(w, walker->level, pte));
 
 	pte_pkey = FNAME(gpte_pkeys)(vcpu, pte);
+	walker->pte_pkey = pte_pkey;
 	accessed_dirty = have_ad ? pte_access & PT_GUEST_ACCESSED_MASK : 0;
 
 	/* Convert to ACC_*_MASK flags for struct guest_walker.  */
@@ -588,7 +590,8 @@ FNAME(prefetch_gpte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
 	pte_access = sp->role.access & FNAME(gpte_access)(gpte);
 	FNAME(protect_clean_gpte)(vcpu->arch.mmu->w, &pte_access, gpte);
 
-	return kvm_mmu_prefetch_sptes(vcpu, gfn, spte, 1, pte_access);
+	return kvm_mmu_prefetch_sptes(vcpu, gfn, spte, 1, pte_access,
+				      FNAME(gpte_pkeys)(vcpu, gpte));
 }
 
 static bool FNAME(gpte_changed)(struct kvm_vcpu *vcpu,
@@ -788,7 +791,7 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault,
 		return -EFAULT;
 
 	ret = mmu_set_spte(vcpu, fault->slot, it.sptep, gw->pte_access,
-			   base_gfn, fault->pfn, fault);
+			   gw->pte_pkey, base_gfn, fault->pfn, fault);
 	if (ret == RET_PF_SPURIOUS)
 		return ret;
 
@@ -952,6 +955,7 @@ static int FNAME(sync_spte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp, int 
 	pt_element_t gpte;
 	gpa_t pte_gpa;
 	gfn_t gfn;
+	u8 pkey;
 
 	if (WARN_ON_ONCE(sp->spt[i] == SHADOW_NONPRESENT_VALUE ||
 			 !sp->shadowed_translation))
@@ -992,8 +996,12 @@ static int FNAME(sync_spte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp, int 
 	 * still, and prefetch_invalid_gpte() has verified that the A/D bits
 	 * are set in the "new" gPTE, i.e. there is no danger of missing an A/D
 	 * update due to A/D bits being set in the SPTE but not the gPTE.
+	 * If the SPTE carries the guest's protection key, the key must be
+	 * unchanged as well.
 	 */
-	if (kvm_mmu_page_get_access(sp, i) == pte_access)
+	pkey = FNAME(gpte_pkeys)(vcpu, gpte);
+	if (kvm_mmu_page_get_access(sp, i) == pte_access &&
+	    (!sp->role.cr4_pke || spte_guest_pkey(sp->spt[i]) == pkey))
 		return 0;
 
 	/* Update the shadowed access bits in case they changed. */
@@ -1006,6 +1014,7 @@ static int FNAME(sync_spte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp, int 
 	make_spte(vcpu, sp, slot, pte_access, gfn,
 		  spte_to_pfn(spte), spte, true, true,
 		  host_writable, &spte);
+	spte = spte_set_guest_pkey(sp, spte, pkey);
 	kvm_mmu_check_leaf_spte(spte);
 
 	/*
