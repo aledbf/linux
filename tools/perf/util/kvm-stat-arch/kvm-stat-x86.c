@@ -7,12 +7,33 @@
 #include "../../../arch/x86/include/uapi/asm/svm.h"
 #include "../../../arch/x86/include/uapi/asm/vmx.h"
 #include "../../../arch/x86/include/uapi/asm/kvm.h"
+#include "../../../arch/x86/include/uapi/asm/pvm_trace.h"
 
 define_exit_reasons_table(vmx_exit_reasons, VMX_EXIT_REASONS);
 define_exit_reasons_table(svm_exit_reasons, SVM_EXIT_REASONS);
+define_exit_reasons_table(pvm_exit_reasons, PVM_EXIT_REASONS);
+
+/* The kvm_exit "isa" field of a PVM host, KVM_ISA_PVM in arch/x86/kvm/trace.h. */
+#define KVM_ISA_PVM	3
+
+/*
+ * PVM is a KVM vendor module rather than a CPU feature, so the CPUID string
+ * cannot tell it apart; the "isa" field of each kvm_exit sample can.
+ */
+static bool x86_exit_event_begin(struct perf_sample *sample,
+				 struct event_key *key)
+{
+	if (!exit_event_begin(sample, key))
+		return false;
+
+	if (perf_sample__intval(sample, "isa") == KVM_ISA_PVM)
+		key->exit_reasons = pvm_exit_reasons;
+
+	return true;
+}
 
 static const struct kvm_events_ops exit_events = {
-	.is_begin_event = exit_event_begin,
+	.is_begin_event = x86_exit_event_begin,
 	.is_end_event = exit_event_end,
 	.decode_key = exit_event_decode_key,
 	.name = "VM-EXIT"
