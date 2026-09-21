@@ -13,6 +13,8 @@
 #include <asm/pvm_para.h>
 #include <asm/setup.h>
 
+DEFINE_PER_CPU_PAGE_ALIGNED(struct pvm_vcpu_struct, pvm_vcpu_struct);
+
 #ifndef CONFIG_RANDOMIZE_MEMORY
 /* DIRECT_MAP_PHYSMEM_END in a PVM_GUEST kernel; kaslr.c defines it otherwise. */
 unsigned long direct_map_physmem_end __ro_after_init;

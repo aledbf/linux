@@ -2,7 +2,48 @@
 #ifndef _ASM_X86_PKRU_H
 #define _ASM_X86_PKRU_H
 
+#include <linux/percpu-defs.h>
 #include <asm/cpufeature.h>
+
+/*
+ * A PVM guest kernel runs at CPL3 on a PKRU the hypervisor owns, and the
+ * current task's PKRU is PVCS::pkru, which the hypervisor loads on the return
+ * to user mode.
+ */
+#ifdef CONFIG_PVM_GUEST
+#include <uapi/asm/pvm_para.h>
+
+DECLARE_PER_CPU_PAGE_ALIGNED(struct pvm_vcpu_struct, pvm_vcpu_struct);
+
+static __always_inline bool pkru_in_pvcs(void)
+{
+	return cpu_feature_enabled(X86_FEATURE_KVM_PVM_GUEST);
+}
+
+static __always_inline u32 pvcs_read_pkru(void)
+{
+	return this_cpu_read(pvm_vcpu_struct.pkru);
+}
+
+static __always_inline void pvcs_write_pkru(u32 pkru)
+{
+	this_cpu_write(pvm_vcpu_struct.pkru, pkru);
+}
+#else
+static __always_inline bool pkru_in_pvcs(void)
+{
+	return false;
+}
+
+static __always_inline u32 pvcs_read_pkru(void)
+{
+	return 0;
+}
+
+static __always_inline void pvcs_write_pkru(u32 pkru)
+{
+}
+#endif
 
 #define PKRU_AD_BIT 0x1u
 #define PKRU_WD_BIT 0x2u
@@ -32,17 +73,29 @@ static inline bool __pkru_allows_write(u32 pkru, u16 pkey)
 	return !(pkru & ((PKRU_AD_BIT|PKRU_WD_BIT) << pkru_pkey_bits));
 }
 
+/*
+ * The current task's PKRU, the value user mode runs with.  Access it only
+ * through these, not with RDPKRU and WRPKRU.
+ */
 static inline u32 read_pkru(void)
 {
-	if (cpu_feature_enabled(X86_FEATURE_OSPKE))
-		return rdpkru();
-	return 0;
+	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
+		return 0;
+
+	if (pkru_in_pvcs())
+		return pvcs_read_pkru();
+	return rdpkru();
 }
 
 static inline void write_pkru(u32 pkru)
 {
 	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
 		return;
+
+	if (pkru_in_pvcs()) {
+		pvcs_write_pkru(pkru);
+		return;
+	}
 	/*
 	 * WRPKRU is relatively expensive compared to RDPKRU.
 	 * Avoid WRPKRU when it would not change the value.
@@ -56,6 +109,10 @@ static inline void pkru_write_default(void)
 	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
 		return;
 
+	if (pkru_in_pvcs()) {
+		pvcs_write_pkru(pkru_get_init_value());
+		return;
+	}
 	wrpkru(pkru_get_init_value());
 }
 
@@ -66,12 +123,17 @@ static inline void pkru_write_default(void)
  */
 static inline u32 __read_pkru(void)
 {
+	if (pkru_in_pvcs())
+		return pvcs_read_pkru();
 	return rdpkru();
 }
 
 static inline void __write_pkru(u32 pkru)
 {
-	wrpkru(pkru);
+	if (pkru_in_pvcs())
+		pvcs_write_pkru(pkru);
+	else
+		wrpkru(pkru);
 }
 
 #endif

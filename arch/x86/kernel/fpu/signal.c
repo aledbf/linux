@@ -262,6 +262,22 @@ static int __restore_fpregs_from_user(void __user *buf, u64 ufeatures,
 	}
 }
 
+/* The PKRU an XRSTOR from the signal frame @buf would load. */
+static int pkru_from_sigframe(struct xregs_state __user *buf, u32 *pkru)
+{
+	u64 xfeatures;
+
+	if (get_user(xfeatures, &buf->header.xfeatures))
+		return -EFAULT;
+
+	if (!(xfeatures & XFEATURE_MASK_PKRU)) {
+		*pkru = 0;
+		return 0;
+	}
+
+	return get_user(*pkru, (u32 __user *)get_xsave_addr_user(buf, XFEATURE_PKRU));
+}
+
 /*
  * Attempt to restore the FPU registers directly from user memory.
  * Pagefaults are handled and any errors returned are fatal.
@@ -269,17 +285,38 @@ static int __restore_fpregs_from_user(void __user *buf, u64 ufeatures,
 static bool restore_fpregs_from_user(void __user *buf, u64 xrestore, bool fx_only)
 {
 	struct fpu *fpu = x86_task_fpu(current);
+	u64 ufeatures = fpu->fpstate->user_xfeatures;
+	bool load_pkru = false;
+	u32 pkru = 0;
 	int ret;
 
 	/* Restore enabled features only. */
-	xrestore &= fpu->fpstate->user_xfeatures;
+	xrestore &= ufeatures;
+
+	/*
+	 * If the task's PKRU is not the register the kernel runs on, see
+	 * pkru_in_pvcs(), XRSTOR must not load the register.  Leave PKRU out
+	 * of the restore and write_pkru() the value XRSTOR would have loaded:
+	 * the one in the frame, or the init value 0.  FXRSTOR leaves PKRU
+	 * alone.
+	 */
+	if (pkru_in_pvcs() && (ufeatures & XFEATURE_MASK_PKRU)) {
+		if (!(xrestore & XFEATURE_MASK_PKRU)) {
+			load_pkru = true;
+		} else if (!fx_only) {
+			if (pkru_from_sigframe(buf, &pkru))
+				return false;
+			load_pkru = true;
+		}
+		ufeatures &= ~XFEATURE_MASK_PKRU;
+		xrestore &= ~XFEATURE_MASK_PKRU;
+	}
 retry:
 	fpregs_lock();
 	/* Ensure that XFD is up to date */
 	xfd_update_state(fpu->fpstate);
 	pagefault_disable();
-	ret = __restore_fpregs_from_user(buf, fpu->fpstate->user_xfeatures,
-					 xrestore, fx_only);
+	ret = __restore_fpregs_from_user(buf, ufeatures, xrestore, fx_only);
 	pagefault_enable();
 
 	if (unlikely(ret)) {
@@ -319,6 +356,9 @@ retry:
 	if (test_thread_flag(TIF_NEED_FPU_LOAD) && xfeatures_mask_supervisor())
 		os_xrstor_supervisor(fpu->fpstate);
 
+	if (load_pkru)
+		write_pkru(pkru);
+
 	fpregs_mark_activate();
 	fpregs_unlock();
 	return true;
@@ -331,6 +371,8 @@ static bool __fpu_restore_sig(void __user *buf, void __user *buf_fx,
 	struct fpu *fpu = x86_task_fpu(tsk);
 	struct user_i387_ia32_struct env;
 	bool success, fx_only = false;
+	bool load_pkru = false;
+	u32 pkru = 0;
 	union fpregs_state *fpregs;
 	u64 user_xfeatures = 0;
 
@@ -421,16 +463,28 @@ static bool __fpu_restore_sig(void __user *buf, void __user *buf_fx,
 		 * Preserve supervisor states!
 		 */
 		u64 mask = user_xfeatures | xfeatures_mask_supervisor();
+		u64 rmask = fpu_kernel_cfg.max_features;
 
 		fpregs->xsave.header.xfeatures &= mask;
-		success = !os_xrstor_safe(fpu->fpstate,
-					  fpu_kernel_cfg.max_features);
+
+		/* See restore_fpregs_from_user(). */
+		if (pkru_in_pvcs() && (rmask & XFEATURE_MASK_PKRU)) {
+			if (fpregs->xsave.header.xfeatures & XFEATURE_MASK_PKRU)
+				pkru = tsk->thread.pkru;
+			load_pkru = true;
+			rmask &= ~XFEATURE_MASK_PKRU;
+		}
+
+		success = !os_xrstor_safe(fpu->fpstate, rmask);
 	} else {
 		success = !fxrstor_safe(&fpregs->fxsave);
 	}
 
-	if (likely(success))
+	if (likely(success)) {
+		if (load_pkru)
+			write_pkru(pkru);
 		fpregs_mark_activate();
+	}
 
 	fpregs_unlock();
 	return success;
