@@ -121,6 +121,21 @@ static u64 pvm_read_guest_gs_base(struct vcpu_pvm *pvm)
 	return pvm->segments[VCPU_SREG_GS].base;
 }
 
+static u64 pvm_read_guest_fs_base(struct vcpu_pvm *pvm)
+{
+	preempt_disable();
+	if (pvm->loaded_cpu_state)
+		__save_fs_base(pvm);
+	preempt_enable();
+
+	return pvm->segments[VCPU_SREG_FS].base;
+}
+
+static u64 pvm_read_guest_kernel_gs_base(struct vcpu_pvm *pvm)
+{
+	return pvm->msr_kernel_gs_base;
+}
+
 /*
  * The GS base the guest runs with is written to the hardware, which faults on
  * a non-canonical value.  Some of the values come straight from the guest --
@@ -137,6 +152,20 @@ static void pvm_write_guest_gs_base(struct vcpu_pvm *pvm, u64 data)
 	if (pvm->loaded_cpu_state)
 		__load_gs_base(pvm);
 	preempt_enable();
+}
+
+static void pvm_write_guest_fs_base(struct vcpu_pvm *pvm, u64 data)
+{
+	preempt_disable();
+	pvm->segments[VCPU_SREG_FS].base = data;
+	if (pvm->loaded_cpu_state)
+		__load_fs_base(pvm);
+	preempt_enable();
+}
+
+static void pvm_write_guest_kernel_gs_base(struct vcpu_pvm *pvm, u64 data)
+{
+	pvm->msr_kernel_gs_base = data;
 }
 
 /*
@@ -172,6 +201,19 @@ static bool pvm_disallowed_va(struct kvm_vcpu *vcpu, u64 va)
 	return !pvm_guest_allowed_va(vcpu, va);
 }
 
+/*
+ * A guest code address the hypervisor or the switcher acts on: the entry
+ * points in MSR_LSTAR and MSR_PVM_EVENT_ENTRY, and the ERETU instruction in
+ * MSR_PVM_RETU_RIP.  Canonical is not enough, the guest owns only the lower
+ * half: an entry point in the upper half faults on the host's pages, and the
+ * fault is delivered to that same entry point, forever.
+ */
+static bool pvm_invalid_entry_point(struct kvm_vcpu *vcpu, u64 addr)
+{
+	return is_noncanonical_msr_address(addr, vcpu) ||
+	       !pvm_guest_allowed_va(vcpu, addr);
+}
+
 static void __set_cpuid_faulting(bool on)
 {
 	u64 msrval;
@@ -198,6 +240,25 @@ static void set_cpuid_intercept(struct kvm_vcpu *vcpu)
 
 	if (enable_cpuid_intercept || cpuid_fault_enabled(vcpu))
 		__set_cpuid_faulting(true);
+}
+
+static void pvm_update_guest_cpuid_faulting(struct kvm_vcpu *vcpu, u64 data)
+{
+	bool guest_enabled = cpuid_fault_enabled(vcpu);
+	bool set_enabled = data & MSR_MISC_FEATURES_ENABLES_CPUID_FAULT;
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	if (!(guest_enabled ^ set_enabled))
+		return;
+	if (enable_cpuid_intercept)
+		return;
+	if (test_thread_flag(TIF_NOCPUID))
+		return;
+
+	preempt_disable();
+	if (pvm->loaded_cpu_state)
+		__set_cpuid_faulting(set_enabled);
+	preempt_enable();
 }
 
 /*
@@ -591,6 +652,307 @@ static void pvm_vcpu_put(struct kvm_vcpu *vcpu)
 	struct vcpu_pvm *pvm = to_pvm(vcpu);
 
 	pvm_prepare_switch_to_host(pvm);
+}
+
+static u64 pvm_get_l2_tsc_offset(struct kvm_vcpu *vcpu)
+{
+	return 0;
+}
+
+static u64 pvm_get_l2_tsc_multiplier(struct kvm_vcpu *vcpu)
+{
+	return kvm_caps.default_tsc_scaling_ratio;
+}
+
+/*
+ * The guest's TSC is the host's TSC.  RDTSC and RDTSCP run natively at CPL3,
+ * where the hardware applies no offset and no scaling, so whatever offset KVM
+ * computes -- from a TSC write, TSC_ADJUST, vCPU creation or a restore -- is
+ * dropped here, and kvmclock is computed against the host TSC the guest reads.
+ * KVM keeps its own bookkeeping of the offsets, which is what keeps vCPUs
+ * created together "matched" for the master clock.
+ *
+ * The frequency cannot differ either: pvm_vcpu_create() refuses a VM-wide
+ * frequency that is not the host's and pvm_handle_exit() a vCPU one.
+ */
+static void pvm_write_tsc_offset(struct kvm_vcpu *vcpu)
+{
+	vcpu->arch.tsc_offset = 0;
+	vcpu->arch.l1_tsc_offset = 0;
+}
+
+/* Never called: PVM does not set kvm_caps.has_tsc_control. */
+static void pvm_write_tsc_multiplier(struct kvm_vcpu *vcpu)
+{
+}
+
+static int pvm_get_feature_msr(u32 msr, u64 *data)
+{
+	/* PVM exposes no feature MSRs. */
+	return 1;
+}
+
+static inline bool is_pvm_feature_control_msr_valid(struct vcpu_pvm *pvm,
+						    struct msr_data *msr_info)
+{
+	/*
+	 * currently only FEAT_CTL_LOCKED bit is valid, maybe
+	 * vmx, sgx and mce associated bits can be valid when those features
+	 * are supported for guest.
+	 */
+	u64 valid_bits = pvm->msr_ia32_feature_control_valid_bits;
+
+	if (!msr_info->host_initiated &&
+	    (pvm->msr_ia32_feature_control & FEAT_CTL_LOCKED))
+		return false;
+
+	return !(msr_info->data & ~valid_bits);
+}
+
+static void pvm_update_uret_msr(struct vcpu_pvm *pvm, unsigned int slot,
+				u64 data, u64 mask)
+{
+	preempt_disable();
+	if (pvm->loaded_cpu_state)
+		kvm_set_user_return_msr(slot, data, mask);
+	preempt_enable();
+}
+
+/*
+ * Reads an msr value (of 'msr_index') into 'msr_info'.
+ * Returns 0 on success, non-0 otherwise.
+ * Assumes vcpu_load() was already called.
+ */
+static int pvm_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	int ret = 0;
+
+	switch (msr_info->index) {
+	case MSR_FS_BASE:
+		msr_info->data = pvm_read_guest_fs_base(pvm);
+		break;
+	case MSR_GS_BASE:
+		msr_info->data = pvm_read_guest_gs_base(pvm);
+		break;
+	case MSR_KERNEL_GS_BASE:
+		msr_info->data = pvm_read_guest_kernel_gs_base(pvm);
+		break;
+	case MSR_STAR:
+		msr_info->data = pvm->msr_star;
+		break;
+	case MSR_LSTAR:
+		msr_info->data = pvm->msr_lstar;
+		break;
+	case MSR_SYSCALL_MASK:
+		msr_info->data = pvm->msr_syscall_mask;
+		break;
+	case MSR_CSTAR:
+		msr_info->data = pvm->msr_cstar;
+		break;
+	/*
+	 * Since SYSENTER is not supported for the guest, we return a bad
+	 * segment to the emulator when emulating the instruction for #GP.
+	 */
+	case MSR_IA32_SYSENTER_CS:
+		msr_info->data = GDT_ENTRY_INVALID_SEG;
+		break;
+	case MSR_IA32_SYSENTER_EIP:
+		msr_info->data = pvm->msr_sysenter_eip;
+		break;
+	case MSR_IA32_SYSENTER_ESP:
+		msr_info->data = pvm->msr_sysenter_esp;
+		break;
+	case MSR_TSC_AUX:
+		msr_info->data = pvm->msr_tsc_aux;
+		break;
+	case MSR_IA32_DEBUGCTLMSR:
+		msr_info->data = 0;
+		break;
+	case MSR_IA32_FEAT_CTL:
+		msr_info->data = pvm->msr_ia32_feature_control;
+		break;
+	case MSR_IA32_BNDCFGS:
+		msr_info->data = pvm->msr_bndcfgs;
+		break;
+	case MSR_PVM_VCPU_STRUCT:
+		msr_info->data = pvm->msr_vcpu_struct;
+		break;
+	case MSR_PVM_EVENT_ENTRY:
+		msr_info->data = pvm->msr_event_entry;
+		break;
+	case MSR_PVM_RETU_RIP:
+		msr_info->data = pvm->msr_retu_rip_plus2 ?
+				 pvm->msr_retu_rip_plus2 - 2 : 0;
+		break;
+	case MSR_PVM_FEATURES_ENABLED:
+		msr_info->data = pvm->msr_features_enabled;
+		break;
+	default:
+		ret = kvm_get_msr_common(vcpu, msr_info);
+	}
+
+	return ret;
+}
+
+/*
+ * Writes msr value into the appropriate "register".
+ * Returns 0 on success, non-0 otherwise.
+ * Assumes vcpu_load() was already called.
+ */
+static int pvm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	int ret = 0;
+	u32 msr_index = msr_info->index;
+	u64 data = msr_info->data;
+
+	switch (msr_index) {
+	case MSR_FS_BASE:
+		pvm_write_guest_fs_base(pvm, data);
+		break;
+	case MSR_GS_BASE:
+		pvm_write_guest_gs_base(pvm, data);
+		break;
+	case MSR_KERNEL_GS_BASE:
+		pvm_write_guest_kernel_gs_base(pvm, data);
+		break;
+	case MSR_STAR:
+		/*
+		 * Guest KERNEL_CS/DS shouldn't be NULL and guest USER_CS/DS
+		 * must be the same as the host USER_CS/DS.
+		 */
+		if (!msr_info->host_initiated) {
+			if (!kernel_cs_by_msr(data))
+				return 1;
+			if (user_cs_by_msr(data) != __USER_CS)
+				return 1;
+		}
+		pvm->msr_star = data;
+		break;
+	case MSR_LSTAR:
+		if (pvm_invalid_entry_point(vcpu, data))
+			return 1;
+		pvm->msr_lstar = data;
+		break;
+	case MSR_SYSCALL_MASK:
+		pvm->msr_syscall_mask = data;
+		break;
+	case MSR_CSTAR:
+		pvm->msr_cstar = data;
+		break;
+	case MSR_IA32_SYSENTER_CS:
+		/* Not kept: reads return GDT_ENTRY_INVALID_SEG, see pvm_get_msr(). */
+		break;
+	case MSR_IA32_SYSENTER_EIP:
+		pvm->msr_sysenter_eip = data;
+		break;
+	case MSR_IA32_SYSENTER_ESP:
+		pvm->msr_sysenter_esp = data;
+		break;
+	case MSR_TSC_AUX:
+		pvm->msr_tsc_aux = data;
+		pvm_update_uret_msr(pvm, 1, data, -1ull);
+		break;
+	case MSR_IA32_DEBUGCTLMSR:
+		/*
+		 * Neither LBR nor BTF can be given to a guest at CPL3, and the
+		 * guest cannot be told so.  Like kvm-amd without LBR
+		 * virtualization, drop the write and read back 0.
+		 */
+		if (data)
+			kvm_pr_unimpl_wrmsr(vcpu, msr_index, data);
+		break;
+	case MSR_IA32_FEAT_CTL:
+		if (!is_intel || !is_pvm_feature_control_msr_valid(pvm, msr_info))
+			return 1;
+		pvm->msr_ia32_feature_control = data;
+		break;
+	case MSR_MISC_FEATURES_ENABLES:
+		ret = kvm_set_msr_common(vcpu, msr_info);
+		if (!ret)
+			pvm_update_guest_cpuid_faulting(vcpu, data);
+		break;
+	case MSR_PLATFORM_INFO:
+		if ((data & MSR_PLATFORM_INFO_CPUID_FAULT) &&
+		    !boot_cpu_has(X86_FEATURE_CPUID_FAULT))
+			return 1;
+		ret = kvm_set_msr_common(vcpu, msr_info);
+		break;
+	case MSR_IA32_BNDCFGS:
+		if (!kvm_mpx_supported() ||
+		    (!msr_info->host_initiated &&
+		     !guest_cpu_cap_has(vcpu, X86_FEATURE_MPX)))
+			return 1;
+		if (is_noncanonical_msr_address(data & PAGE_MASK, vcpu) ||
+		    (data & MSR_IA32_BNDCFGS_RSVD))
+			return 1;
+		/*
+		 * As the full MPX feature function has been deprecated in the
+		 * Linux kernel, it is acceptable to ignore supervisor mode MPX
+		 * control for simplicity.
+		 */
+		pvm->msr_bndcfgs = data;
+		break;
+	case MSR_PVM_VCPU_STRUCT:
+		if (!PAGE_ALIGNED(data))
+			return 1;
+		/*
+		 * A VMM restoring a VM may set this before the memslot holding
+		 * the page exists.  So a failed pin does not fail the write: it
+		 * is retried by KVM_REQ_PINNED_PAGES_RELOAD before the next entry,
+		 * which triple faults the vCPU if the page is still not there.
+		 */
+		pvm->msr_vcpu_struct = data;
+		kvm_make_request(KVM_REQ_EVENT, vcpu);
+		if (!data) {
+			pvm->switch_flags |= SWITCH_FLAGS_PVCS_INVALID;
+			pvm_unpin_vcpu_struct(pvm);
+		} else {
+			/*
+			 * Even if the pin fails: the retry either pins it
+			 * before the next entry or triple faults the vCPU.
+			 */
+			pvm->switch_flags &= ~SWITCH_FLAGS_PVCS_INVALID;
+			if (pvm_pin_vcpu_struct(pvm, data))
+				kvm_make_request(KVM_REQ_PINNED_PAGES_RELOAD, vcpu);
+		}
+		break;
+	case MSR_PVM_EVENT_ENTRY:
+		/* The three entry points are at +0, +256 and +PVM_EVENT_ENTRY_SUPERVISOR_OFFSET. */
+		if (pvm_invalid_entry_point(vcpu, data) ||
+		    pvm_invalid_entry_point(vcpu, data + 256) ||
+		    pvm_invalid_entry_point(vcpu, data + PVM_EVENT_ENTRY_SUPERVISOR_OFFSET)) {
+			/*
+			 * A guest without an event entry cannot take the #GP
+			 * that would report this.
+			 */
+			if (!msr_info->host_initiated)
+				kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+			return 1;
+		}
+		pvm->msr_event_entry = data;
+		break;
+	case MSR_PVM_RETU_RIP:
+		if (pvm_invalid_entry_point(vcpu, data))
+			return 1;
+		/*
+		 * 0, the reset value, names no ERETU instruction and reads
+		 * back as 0: a SYSCALL in the guest's half never leaves RIP 0.
+		 */
+		pvm->msr_retu_rip_plus2 = data ? data + 2 : 0;
+		break;
+	case MSR_PVM_FEATURES_ENABLED:
+		/* Only what PVM_CPUID_FEATURES said is there. */
+		if (data & ~PVM_FEATURES_SUPPORTED)
+			return 1;
+		pvm->msr_features_enabled = data;
+		break;
+	default:
+		ret = kvm_set_msr_common(vcpu, msr_info);
+	}
+
+	return ret;
 }
 
 static void pvm_cache_reg(struct kvm_vcpu *vcpu, enum kvm_reg reg)
@@ -1236,6 +1598,29 @@ static void pvm_setup_mce(struct kvm_vcpu *vcpu)
 {
 }
 
+static bool pvm_has_emulated_msr(struct kvm *kvm, u32 index)
+{
+	switch (index) {
+	case MSR_IA32_MCG_EXT_CTL:
+	case KVM_FIRST_EMULATED_VMX_MSR ... KVM_LAST_EMULATED_VMX_MSR:
+		return false;
+	case MSR_AMD64_VIRT_SPEC_CTRL:
+	case MSR_AMD64_TSC_RATIO:
+		/* This is AMD SVM only. */
+		return false;
+	case MSR_IA32_SMBASE:
+		/* No SMM. */
+		return false;
+	case MSR_PVM_VCPU_STRUCT ... MSR_PVM_FEATURES_ENABLED:
+		/* The guest's PVM state, saved and restored like any other. */
+		return true;
+	default:
+		break;
+	}
+
+	return true;
+}
+
 static bool cpu_has_pvm_wbinvd_exit(void)
 {
 	return true;
@@ -1580,6 +1965,16 @@ static void pvm_hv_inject_synthetic_vmexit_post_tlb_flush(struct kvm_vcpu *vcpu)
 #endif
 
 /*
+ * Every guest MSR access already arrives here -- WRMSR and RDMSR fault at
+ * CPL3, and PVM_HC_RDMSR/WRMSR are hypercalls -- and goes through
+ * kvm_emulate_msr_{read,write}(), where the VMM's filter is applied.  There is
+ * no bitmap to recompute when the filter or the guest's CPUID changes.
+ */
+static void pvm_recalc_intercepts(struct kvm_vcpu *vcpu)
+{
+}
+
+/*
  * No posted interrupts: kvm_arch_has_irq_bypass() is false without APICv,
  * which PVM never enables, so nothing asks to post one.  Refuse if something
  * does, rather than let KVM believe an interrupt is being delivered.
@@ -1614,6 +2009,7 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.hardware_unsetup = pvm_hardware_unsetup,
 	.enable_virtualization_cpu = pvm_enable_virtualization_cpu,
 	.disable_virtualization_cpu = pvm_disable_virtualization_cpu,
+	.has_emulated_msr = pvm_has_emulated_msr,
 
 	.has_wbinvd_exit = cpu_has_pvm_wbinvd_exit,
 
@@ -1627,6 +2023,9 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.vcpu_load = pvm_vcpu_load,
 	.vcpu_put = pvm_vcpu_put,
 
+	.get_feature_msr = pvm_get_feature_msr,
+	.get_msr = pvm_get_msr,
+	.set_msr = pvm_set_msr,
 	.get_segment_base = pvm_get_segment_base,
 	.get_segment = pvm_get_segment,
 	.set_segment = pvm_set_segment,
@@ -1669,6 +2068,8 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.refresh_apicv_exec_ctrl = pvm_refresh_apicv_exec_ctrl,
 	.deliver_interrupt = pvm_deliver_interrupt,
 
+	.recalc_intercepts = pvm_recalc_intercepts,
+
 	.pi_update_irte = pvm_pi_update_irte,
 
 	.setup_mce = pvm_setup_mce,
@@ -1681,8 +2082,13 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 #endif
 
 	.apic_init_signal_blocked = pvm_apic_init_signal_blocked,
+	.complete_emulated_msr = kvm_complete_insn_gp,
 	.vcpu_deliver_sipi_vector = kvm_vcpu_deliver_sipi_vector,
 
+	.get_l2_tsc_offset = pvm_get_l2_tsc_offset,
+	.get_l2_tsc_multiplier = pvm_get_l2_tsc_multiplier,
+	.write_tsc_offset = pvm_write_tsc_offset,
+	.write_tsc_multiplier = pvm_write_tsc_multiplier,
 	.disallowed_va = pvm_disallowed_va,
 	.reload_pinned_pages = pvm_reload_pinned_pages,
 };

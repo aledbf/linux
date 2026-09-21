@@ -317,6 +317,12 @@ static const u32 emulated_msrs_all[] = {
 
 	MSR_K7_HWCR,
 	MSR_KVM_POLL_CONTROL,
+
+	/* Only kvm-pvm reports these, see has_emulated_msr(). */
+	MSR_PVM_VCPU_STRUCT,
+	MSR_PVM_EVENT_ENTRY,
+	MSR_PVM_RETU_RIP,
+	MSR_PVM_FEATURES_ENABLED,
 };
 
 static u32 emulated_msrs[ARRAY_SIZE(emulated_msrs_all)];

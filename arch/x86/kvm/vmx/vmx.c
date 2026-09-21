@@ -7234,6 +7234,9 @@ bool vmx_has_emulated_msr(struct kvm *kvm, u32 index)
 	case MSR_AMD64_TSC_RATIO:
 		/* This is AMD only.  */
 		return false;
+	case MSR_PVM_VCPU_STRUCT ... MSR_PVM_FEATURES_ENABLED:
+		/* This is PVM only. */
+		return false;
 	default:
 		return true;
 	}

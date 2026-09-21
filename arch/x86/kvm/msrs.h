@@ -4,6 +4,7 @@
 
 #include <linux/kvm_host.h>
 #include <linux/user-return-notifier.h>
+#include <uapi/asm/pvm_para.h>
 
 #include "cpuid.h"
 #include "regs.h"
