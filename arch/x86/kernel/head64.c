@@ -73,6 +73,16 @@ SYM_PIC_ALIAS(kernel_map_base);
 #endif
 unsigned long vmalloc_base __ro_after_init = __VMALLOC_BASE_L4;
 EXPORT_SYMBOL(vmalloc_base);
+#ifdef CONFIG_PVM_GUEST
+/*
+ * A PVM guest lays out its address space at boot, which sizes the vmalloc
+ * area and places the CPU entry area.  See pvm_kernel_layout_relocate().
+ */
+unsigned long vmalloc_size_tb __ro_after_init = VMALLOC_SIZE_TB_L4;
+EXPORT_SYMBOL(vmalloc_size_tb);
+unsigned long cpu_entry_area_base __ro_after_init = RAW_CPU_ENTRY_AREA_BASE;
+EXPORT_SYMBOL_GPL(cpu_entry_area_base);
+#endif
 unsigned long vmemmap_base __ro_after_init = __VMEMMAP_BASE_L4;
 EXPORT_SYMBOL(vmemmap_base);
 
@@ -266,6 +276,9 @@ asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode
 		page_offset_base	= __PAGE_OFFSET_BASE_L5;
 		vmalloc_base		= __VMALLOC_BASE_L5;
 		vmemmap_base		= __VMEMMAP_BASE_L5;
+#ifdef CONFIG_PVM_GUEST
+		vmalloc_size_tb		= VMALLOC_SIZE_TB_L5;
+#endif
 	}
 
 	clear_bss();

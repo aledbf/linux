@@ -82,7 +82,11 @@ extern unsigned long pvm_task_size_max;
 #define __VIRTUAL_MASK_SHIFT	(pgtable_l5_enabled() ? 56 : 47)
 
 #define TASK_SIZE_MAX		task_size_max()
+#ifdef CONFIG_PVM_GUEST
+#define DEFAULT_MAP_WINDOW	default_map_window()
+#else
 #define DEFAULT_MAP_WINDOW	((1UL << 47) - PAGE_SIZE)
+#endif
 
 /* This decides where the kernel will search for a free chunk of vm
  * space during mmap's.

@@ -395,6 +395,14 @@ void __init map_vsyscall(void)
 	unsigned long physaddr_vsyscall = __pa_symbol(&__vsyscall_page);
 
 	/*
+	 * VSYSCALL_ADDR is in the host's half of the address space, which a
+	 * PVM guest cannot map; only XONLY emulation is possible.
+	 */
+	if (vsyscall_mode == EMULATE &&
+	    cpu_feature_enabled(X86_FEATURE_KVM_PVM_GUEST))
+		vsyscall_mode = XONLY;
+
+	/*
 	 * For full emulation, the page needs to exist for real.  In
 	 * execute-only mode, there is no PTE at all backing the vsyscall
 	 * page.

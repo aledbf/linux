@@ -17,6 +17,7 @@
 #include <linux/highmem.h>
 #include <linux/pci.h>
 #include <linux/ptdump.h>
+#include <linux/sort.h>
 
 #include <asm/e820/types.h>
 
@@ -94,7 +95,7 @@ static struct addr_marker address_markers[] = {
 #ifdef CONFIG_MODIFY_LDT_SYSCALL
 	[LDT_NR]		= { 0UL,		"LDT remap" },
 #endif
-	[CPU_ENTRY_AREA_NR]	= { CPU_ENTRY_AREA_BASE,"CPU entry Area" },
+	[CPU_ENTRY_AREA_NR]	= { 0UL,		"CPU entry Area" },
 #ifdef CONFIG_X86_ESPFIX64
 	[ESPFIX_START_NR]	= { ESPFIX_BASE_ADDR,	"ESPfix Area", 16 },
 #endif
@@ -510,6 +511,36 @@ bool ptdump_walk_pgd_level_checkwx(void)
 	return ptdump_walk_pgd_level_core(NULL, &init_mm, INIT_PGD, true, false);
 }
 
+#ifdef CONFIG_PVM_GUEST
+static int __init address_markers_sort_cmp(const void *pa, const void *pb)
+{
+	const struct addr_marker *a = pa, *b = pb;
+
+	return (a->start_address > b->start_address) -
+	       (a->start_address < b->start_address);
+}
+
+/*
+ * The markers must be in ascending address order.  A PVM guest moves the
+ * kernel image, modules, fixmap and CPU entry area below the ESPfix and EFI
+ * areas, so sort them once the addresses are known.  This is the last use of
+ * the enum address_markers_idx indices: afterwards the array is only walked
+ * in order.  Markers at the same address may swap, which does not matter.
+ */
+static void __init address_markers_sort(void)
+{
+	if (!cpu_feature_enabled(X86_FEATURE_KVM_PVM_GUEST))
+		return;
+
+	sort(address_markers, ARRAY_SIZE(address_markers),
+	     sizeof(address_markers[0]), address_markers_sort_cmp, NULL);
+}
+#else
+static void __init address_markers_sort(void)
+{
+}
+#endif
+
 static int __init pt_dump_init(void)
 {
 	/*
@@ -531,6 +562,7 @@ static int __init pt_dump_init(void)
 	address_markers[MODULES_VADDR_NR].start_address = MODULES_VADDR;
 	address_markers[MODULES_END_NR].start_address = MODULES_END;
 	address_markers[FIXADDR_START_NR].start_address = FIXADDR_START;
+	address_markers[CPU_ENTRY_AREA_NR].start_address = CPU_ENTRY_AREA_BASE;
 #endif
 #ifdef CONFIG_X86_32
 	address_markers[VMALLOC_START_NR].start_address = VMALLOC_START;
@@ -544,6 +576,8 @@ static int __init pt_dump_init(void)
 	address_markers[LDT_NR].start_address = LDT_BASE_ADDR;
 # endif
 #endif
+	address_markers_sort();
+
 	return 0;
 }
 __initcall(pt_dump_init);

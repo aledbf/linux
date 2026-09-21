@@ -21,6 +21,7 @@
 extern bool pvm_detected;
 
 void __init pvm_relocate_kernel(unsigned long physbase);
+bool __init pvm_kernel_layout_relocate(void);
 
 /* The page tables the PVH entry point runs on, from platform/pvh/head.S. */
 extern char pvh_init_top_pgt[], pvh_level3_ident_pgt[];
@@ -96,6 +97,11 @@ static inline bool pvm_detect(void)
 	eax = PVM_CPUID_FEATURES;
 	pvm_cpuid(&eax, &ebx, &ecx, &edx);
 	return eax == PVM_ABI_VERSION;
+}
+#else
+static inline bool pvm_kernel_layout_relocate(void)
+{
+	return false;
 }
 #endif /* CONFIG_PVM_GUEST */
 #endif /* !__ASSEMBLER__ */

@@ -216,6 +216,18 @@ static __always_inline bool cpu_wants_rethunk_at(void *addr)
 		: output : "i" (0), ## input)
 
 /*
+ * Like alternative_io, but with two features and respective instructions.
+ *
+ * If the CPU has feature2, newinstr2 is used; otherwise, if it has feature1,
+ * newinstr1 is used; otherwise oldinstr is used.
+ */
+#define alternative_io_2(oldinstr, newinstr1, ft_flags1, newinstr2,	\
+			 ft_flags2, output, input...)			\
+	asm_inline volatile(ALTERNATIVE_2(oldinstr, newinstr1, ft_flags1, \
+					  newinstr2, ft_flags2)		\
+		: output : "i" (0), ## input)
+
+/*
  * Like alternative_io, but for replacing a direct call with another one.
  *
  * Use the %c operand modifier which is the generic way to print a bare

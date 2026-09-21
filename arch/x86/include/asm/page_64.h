@@ -22,6 +22,10 @@ extern unsigned long phys_base;
 extern unsigned long page_offset_base;
 extern unsigned long vmalloc_base;
 extern unsigned long vmemmap_base;
+#ifdef CONFIG_PVM_GUEST
+extern unsigned long vmalloc_size_tb;
+extern unsigned long cpu_entry_area_base;
+#endif
 extern unsigned long direct_map_physmem_end;
 
 static __always_inline unsigned long __phys_addr_nodebug(unsigned long x)
@@ -143,14 +147,42 @@ static __always_inline unsigned long task_size_max(void)
 {
 	unsigned long ret;
 
+#ifdef CONFIG_PVM_GUEST
+	/*
+	 * The PVM arm is last, so it wins over LA57 in a PVM guest.  The value
+	 * depends on the paging level and is set by pvm_relocate_kernel(),
+	 * long before alternatives are applied.
+	 */
+	alternative_io_2("movq %[small],%0",
+			"movq %[large],%0", X86_FEATURE_LA57,
+			"movq %[pvm],%0", X86_FEATURE_KVM_PVM_GUEST,
+			"=r" (ret),
+			[small] "i" ((1ul << 47)-PAGE_SIZE),
+			[large] "i" ((1ul << 56)-PAGE_SIZE),
+			[pvm] "m" (pvm_task_size_max));
+#else
 	alternative_io("movq %[small],%0","movq %[large],%0",
 			X86_FEATURE_LA57,
 			"=r" (ret),
 			[small] "i" ((1ul << 47)-PAGE_SIZE),
 			[large] "i" ((1ul << 56)-PAGE_SIZE));
+#endif
 
 	return ret;
 }
+
+#ifdef CONFIG_PVM_GUEST
+/*
+ * The window mmap() hands out without a hint.  A 4-level PVM guest's user
+ * space ends below the 47-bit window, so the window ends with it.
+ */
+static __always_inline unsigned long default_map_window(void)
+{
+	unsigned long max = task_size_max();
+
+	return max < (1UL << 47) - PAGE_SIZE ? max : (1UL << 47) - PAGE_SIZE;
+}
+#endif
 
 #endif	/* !__ASSEMBLER__ */
 

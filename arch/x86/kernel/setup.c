@@ -55,6 +55,7 @@
 #include <asm/pci-direct.h>
 #include <asm/prom.h>
 #include <asm/proto.h>
+#include <asm/pvm_para.h>
 #include <asm/realmode.h>
 #include <asm/thermal.h>
 #include <asm/unwind.h>
@@ -1056,7 +1057,8 @@ void __init setup_arch(char **cmdline_p)
 	 * Define random base addresses for memory sections after max_pfn is
 	 * defined and before each memory section base is used.
 	 */
-	kernel_randomize_memory();
+	if (!pvm_kernel_layout_relocate())
+		kernel_randomize_memory();
 
 #ifdef CONFIG_X86_32
 	/* max_low_pfn get updated here */

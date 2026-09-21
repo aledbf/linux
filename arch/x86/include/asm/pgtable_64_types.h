@@ -114,10 +114,14 @@ extern unsigned int ptrs_per_p4d;
 #define __VMEMMAP_BASE_L5	0xffd4000000000000UL
 
 # define VMALLOC_START		vmalloc_base
+#ifdef CONFIG_PVM_GUEST
+# define VMALLOC_SIZE_TB	vmalloc_size_tb
+#else
 # define VMALLOC_SIZE_TB	(pgtable_l5_enabled() ? VMALLOC_SIZE_TB_L5 : VMALLOC_SIZE_TB_L4)
+#endif
 # define VMEMMAP_START		vmemmap_base
 
-#ifdef CONFIG_RANDOMIZE_MEMORY
+#if defined(CONFIG_RANDOMIZE_MEMORY) || defined(CONFIG_PVM_GUEST)
 # define DIRECT_MAP_PHYSMEM_END	direct_map_physmem_end
 #endif
 
@@ -183,7 +187,12 @@ extern unsigned int ptrs_per_p4d;
 #define ESPFIX_BASE_ADDR	(ESPFIX_PGD_ENTRY << P4D_SHIFT)
 
 #define CPU_ENTRY_AREA_PGD	_AC(-4, UL)
-#define CPU_ENTRY_AREA_BASE	(CPU_ENTRY_AREA_PGD << P4D_SHIFT)
+#define RAW_CPU_ENTRY_AREA_BASE	(CPU_ENTRY_AREA_PGD << P4D_SHIFT)
+#ifdef CONFIG_PVM_GUEST
+#define CPU_ENTRY_AREA_BASE	cpu_entry_area_base
+#else
+#define CPU_ENTRY_AREA_BASE	RAW_CPU_ENTRY_AREA_BASE
+#endif
 
 #define EFI_VA_START		( -4 * (_AC(1, UL) << 30))
 #define EFI_VA_END		(-68 * (_AC(1, UL) << 30))
