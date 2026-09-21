@@ -2034,6 +2034,12 @@ config PHYSICAL_START
 
 	  Don't change this unless you know what you are doing.
 
+config X86_PIE
+	bool
+	help
+	  Build the kernel position-independent, without absolute references
+	  that tie it to the top 2GB of the address space.
+
 config RELOCATABLE
 	bool "Build a relocatable kernel"
 	default y

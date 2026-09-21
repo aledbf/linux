@@ -26,8 +26,14 @@ asm(
 	"arch_rethook_trampoline:\n"
 #ifdef CONFIG_X86_64
 	ANNOTATE_NOENDBR "\n"	/* This is only jumped from ret instruction */
-	/* Push a fake return address to tell the unwinder it's a rethook. */
-	"	pushq $arch_rethook_trampoline\n"
+	/*
+	 * Push a fake return address to tell the unwinder it's a rethook.
+	 * No register is free: push %rax, form the address %rip-relative in
+	 * it and swap the two, which leaves %rax and the flags untouched.
+	 */
+	"	pushq %rax\n"
+	"	leaq arch_rethook_trampoline(%rip), %rax\n"
+	"	xchgq %rax, (%rsp)\n"
 	UNWIND_HINT_FUNC
 	"       pushq $" __stringify(__KERNEL_DS) "\n"
 	/* Save the 'sp - 16', this will be fixed later. */

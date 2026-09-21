@@ -817,9 +817,22 @@ extern bool __raw_callee_save___kvm_vcpu_is_preempted(long);
  * Hand-optimize version for x86-64 to avoid 8 64-bit register saving and
  * restoring to/from the stack.
  */
-#define PV_VCPU_PREEMPTED_ASM						     \
+#ifndef CONFIG_X86_PIE
+#define KVM_CHECK_VCPU_PREEMPTED					     \
  "movq   __per_cpu_offset(,%rdi,8), %rax\n\t"				     \
- "cmpb   $0, " __stringify(KVM_STEAL_TIME_preempted) "+steal_time(%rax)\n\t" \
+ "cmpb   $0, " __stringify(KVM_STEAL_TIME_preempted) "+steal_time(%rax)\n\t"
+#else
+#define KVM_CHECK_VCPU_PREEMPTED					     \
+ "pushq  %rdi\n\t"							     \
+ "leaq   __per_cpu_offset(%rip), %rax\n\t"				     \
+ "movq   (%rax,%rdi,8), %rax\n\t"					     \
+ "leaq   " __stringify(KVM_STEAL_TIME_preempted) "+steal_time(%rip), %rdi\n\t" \
+ "cmpb   $0, (%rax,%rdi,1)\n\t"					     \
+ "popq   %rdi\n\t"
+#endif
+
+#define PV_VCPU_PREEMPTED_ASM						     \
+ KVM_CHECK_VCPU_PREEMPTED						     \
  "setne  %al\n\t"
 
 DEFINE_ASM_FUNC(__raw_callee_save___kvm_vcpu_is_preempted,
