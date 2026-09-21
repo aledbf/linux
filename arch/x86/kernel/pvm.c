@@ -18,6 +18,16 @@
 DEFINE_PER_CPU_PAGE_ALIGNED(struct pvm_vcpu_struct, pvm_vcpu_struct);
 static DEFINE_PER_CPU(unsigned long, pvm_guest_cr3);
 
+/*
+ * Until idt.c installs the real handlers, early events go to
+ * do_early_exception(), as they would through the early IDT.
+ */
+static enum {
+	PVM_EARLY_EXCEPTIONS,
+	PVM_EARLY_TRAPS,	/* #DB and #BP have their real handlers */
+	PVM_EARLY_PF,		/* ... and so has #PF */
+} pvm_early_stage __initdata;
+
 static __always_inline long pvm_hypercall0(unsigned int nr)
 {
 	long ret;
@@ -199,6 +209,48 @@ static void pvm_flush_tlb_one_user(unsigned long addr)
 	pvm_hypercall1(PVM_HC_TLB_INVLPG, addr);
 }
 
+void __init pvm_early_event(struct pt_regs *regs, u32 vector, u32 errcode)
+{
+	if (unlikely(!(vector & PVM_PVCS_EVENT_VECTOR_STD)))
+		return;
+	vector &= 0xFF;
+
+	switch (vector) {
+	case X86_TRAP_DB:
+		if (pvm_early_stage < PVM_EARLY_TRAPS)
+			break;
+		exc_debug(regs);
+		return;
+	case X86_TRAP_BP:
+		if (pvm_early_stage < PVM_EARLY_TRAPS)
+			break;
+		exc_int3(regs);
+		return;
+	case X86_TRAP_PF:
+		if (pvm_early_stage < PVM_EARLY_PF)
+			break;
+		exc_page_fault(regs, errcode);
+		return;
+	}
+
+	do_early_exception(regs, vector);
+}
+
+/* Called after idt_setup_early_traps(). */
+void __init pvm_setup_early_traps(void)
+{
+	pvm_early_stage = PVM_EARLY_TRAPS;
+}
+
+/*
+ * Called after idt_setup_early_pf(), which says why a #PF keeps going to
+ * early_make_pgtable() until then.
+ */
+void __init pvm_setup_early_pf(void)
+{
+	pvm_early_stage = PVM_EARLY_PF;
+}
+
 static noinstr void pvm_bad_event(struct pt_regs *regs, unsigned long vector,
 				  unsigned long error_code)
 {
@@ -366,6 +418,13 @@ void __init pvm_early_setup(void)
 	 * runtime per-CPU area once GSBASE points there.
 	 */
 	wrmsrq(MSR_PVM_VCPU_STRUCT, __pa(this_cpu_ptr(&pvm_vcpu_struct)));
+	/*
+	 * Supervisor events enter at pvm_early_kernel_event_entry.  The user
+	 * entry this implies is unrelated init text, but nothing runs in user
+	 * mode before pvm_setup_event_handling() replaces both.
+	 */
+	wrmsrq(MSR_PVM_EVENT_ENTRY, (unsigned long)pvm_early_kernel_event_entry -
+				    PVM_EVENT_ENTRY_SUPERVISOR_OFFSET);
 }
 
 /*

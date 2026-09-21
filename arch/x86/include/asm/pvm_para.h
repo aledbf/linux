@@ -28,6 +28,8 @@ DECLARE_PER_CPU_PAGE_ALIGNED(struct pvm_vcpu_struct, pvm_vcpu_struct);
 
 void __init pvm_relocate_kernel(unsigned long physbase);
 void __init pvm_early_setup(void);
+void __init pvm_setup_early_traps(void);
+void __init pvm_setup_early_pf(void);
 void pvm_register_pvcs(void);
 void pvm_setup_event_handling(void);
 bool __init pvm_kernel_layout_relocate(void);
@@ -112,6 +114,14 @@ static inline void pvm_early_setup(void)
 {
 }
 
+static inline void pvm_setup_early_traps(void)
+{
+}
+
+static inline void pvm_setup_early_pf(void)
+{
+}
+
 static inline void pvm_register_pvcs(void)
 {
 }
@@ -129,6 +139,7 @@ static inline bool pvm_kernel_layout_relocate(void)
 /* Entry points and paravirt ops in entry_64_pvm.S */
 void entry_SYSCALL_64_pvm(void);
 void pvm_user_event_entry(void);
+void pvm_early_kernel_event_entry(void);
 void pvm_retu_rip(void);
 void pvm_hypercall(void);
 void pvm_save_fl(void);
@@ -137,6 +148,7 @@ void pvm_irq_enable(void);
 void pvm_read_cr2(void);
 
 /* Called from entry_64_pvm.S */
+void __init pvm_early_event(struct pt_regs *regs, u32 vector, u32 errcode);
 void pvm_event(struct pt_regs *regs, u32 vector, u32 errcode);
 #endif /* !__ASSEMBLER__ */
 

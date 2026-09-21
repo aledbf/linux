@@ -2471,6 +2471,7 @@ void __init cpu_init_replace_early_idt(void)
 		cpu_init_fred_exceptions();
 	else
 		idt_setup_early_pf();
+	pvm_setup_early_pf();
 }
 
 /*
