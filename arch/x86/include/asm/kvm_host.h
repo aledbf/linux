@@ -1593,6 +1593,14 @@ struct kvm_x86_ops {
 	 */
 	void (*flush_tlb_guest)(struct kvm_vcpu *vcpu);
 
+	/*
+	 * Return true if the guest may not map @la at all, in which case a
+	 * software walk of the guest page tables fails without reading them.
+	 * Optional: for a vendor without it the static call site is patched
+	 * to return false without a call.
+	 */
+	bool (*disallowed_va)(struct kvm_vcpu *vcpu, u64 la);
+
 	bool (*vcpu_needs_initialization)(struct kvm_vcpu *vcpu);
 	enum exit_fastpath_completion (*vcpu_run)(struct kvm_vcpu *vcpu,
 						  u64 run_flags);

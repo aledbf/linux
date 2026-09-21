@@ -1857,6 +1857,8 @@ static unsigned kvm_page_table_hashfn(gfn_t gfn)
 	return hash_64(gfn, KVM_MMU_HASH_SHIFT);
 }
 
+#define HOST_ROOT_LEVEL (pgtable_l5_enabled() ? PT64_ROOT_5LEVEL : PT64_ROOT_4LEVEL)
+
 static void mmu_page_add_parent_pte(struct kvm *kvm,
 				    struct kvm_mmu_memory_cache *cache,
 				    struct kvm_mmu_page *sp, u64 *parent_pte)
@@ -2388,6 +2390,14 @@ static struct kvm_mmu_page *kvm_mmu_alloc_shadow_page(struct kvm *kvm,
 	list_add(&sp->link, &kvm->arch.active_mmu_pages);
 	kvm_account_mmu_page(kvm, sp);
 
+	/*
+	 * A root for a guest at hardware CPL3 starts out with the host's kernel
+	 * mappings.  They carry neither USER nor SPTE_MMU_PRESENT_MASK, so the
+	 * guest cannot use them and the MMU treats them as not present.
+	 */
+	if (shadow_host_root && role.level == HOST_ROOT_LEVEL)
+		memcpy(sp->spt, shadow_host_root, PAGE_SIZE);
+
 	sp->gfn = gfn;
 	sp->role = role;
 	hlist_add_head(&sp->hash_link, sp_list);
@@ -2609,6 +2619,20 @@ static void __link_shadow_page(struct kvm *kvm,
 
 	spte = make_nonleaf_spte(sp->spt, sp_ad_disabled(sp));
 
+	/*
+	 * A guest at hardware CPL3 runs its kernel and user space at the same
+	 * CPL on USER mappings, so SMEP cannot keep its kernel from executing
+	 * user pages.  Emulate it with NX on the link where a user shadow page
+	 * hangs beneath a kernel one; see mmu_adjust_kernel_only_access().
+	 */
+	if (shadow_guest_cpl3) {
+		struct kvm_mmu_page *parent = sptep_to_sp(sptep);
+
+		if (!(parent->role.access & ACC_USER_MASK) &&
+		    (sp->role.access & ACC_USER_MASK))
+			spte |= shadow_nx_mask;
+	}
+
 	mmu_spte_set(sptep, spte);
 
 	mmu_page_add_parent_pte(kvm, cache, sp, sptep);
@@ -2630,6 +2654,54 @@ static void link_shadow_page(struct kvm_vcpu *vcpu, u64 *sptep,
 			     struct kvm_mmu_page *sp)
 {
 	__link_shadow_page(vcpu->kvm, &vcpu->arch.mmu_pte_list_desc_cache, sptep, sp, true);
+}
+
+/*
+ * The other half of emulating SMEP with NX: strip ACC_USER_MASK from a walk
+ * that is creating kernel-side shadow state, so that __link_shadow_page() can
+ * tell a kernel parent from a user child and make the child non-executable.
+ */
+static unsigned int mmu_adjust_kernel_only_access(struct kvm_vcpu *vcpu,
+						 u64 *sptep,
+						 unsigned int access,
+						 unsigned int leaf_access)
+{
+	if (!shadow_guest_cpl3)
+		return access;
+
+	/*
+	 * A user walk may pass through a kernel shadow page, so keep a kernel
+	 * child that is already linked here rather than replace it with a
+	 * user one; the guest's kernel and user mappings can share an entry at
+	 * this level, and replacing the child would make the next kernel fault
+	 * replace it back.  A user shadow page linked beneath the kernel one
+	 * gets NX on the link, and a user leaf gets NX in make_spte().
+	 */
+	if (leaf_access & ACC_USER_MASK) {
+		if (is_shadow_present_pte(*sptep) && !is_large_pte(*sptep) &&
+		    !(spte_to_child_sp(*sptep)->role.access & ACC_USER_MASK))
+			return access & ~ACC_USER_MASK;
+		return access;
+	}
+
+	access &= ~ACC_USER_MASK;
+
+	if (is_shadow_present_pte(*sptep) && !is_large_pte(*sptep)) {
+		struct kvm_mmu_page *child;
+
+		/*
+		 * No kernel shadow page or leaf may be mapped beneath a user
+		 * shadow page, so a user child linked here must be replaced.
+		 */
+		child = spte_to_child_sp(*sptep);
+		if (!(child->role.access & ACC_USER_MASK))
+			return access;
+
+		drop_parent_pte(vcpu->kvm, child, sptep);
+		kvm_flush_remote_tlbs_sptep(vcpu->kvm, sptep);
+	}
+
+	return access;
 }
 
 static void validate_direct_spte(struct kvm_vcpu *vcpu, u64 *sptep,
@@ -3143,6 +3215,7 @@ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
 
 	wrprot = make_spte(vcpu, sp, slot, pte_access, gfn, pfn, *sptep, prefetch,
 			   false, host_writable, &spte);
+	kvm_mmu_check_leaf_spte(spte);
 
 	if (*sptep == spte) {
 		ret = RET_PF_SPURIOUS;
@@ -4272,6 +4345,15 @@ static int mmu_alloc_special_roots(struct kvm_vcpu *vcpu)
 		return 0;
 
 	/*
+	 * A guest at hardware CPL3 is shadowed at the host's paging level
+	 * (see init_kvm_shadow_mmu()), so a 32-bit or PAE guest page table
+	 * lands here.  Such a guest can only run in 64-bit mode; refuse to
+	 * build NPT-shaped special roots for it.
+	 */
+	if (shadow_guest_cpl3)
+		return -EIO;
+
+	/*
 	 * The special roots should always be allocated in concert.  Yell and
 	 * bail if KVM ends up in a state where only one of the roots is valid.
 	 */
@@ -5249,24 +5331,6 @@ static void nonpaging_init_context(struct kvm_mmu *context)
 	context->sync_spte = NULL;
 }
 
-static inline bool is_root_usable(struct kvm_mmu_root_info *root, gpa_t pgd,
-				  union kvm_mmu_page_role role)
-{
-	struct kvm_mmu_page *sp;
-
-	if (!VALID_PAGE(root->hpa))
-		return false;
-
-	if (!role.direct && pgd != root->pgd)
-		return false;
-
-	sp = root_to_sp(root->hpa);
-	if (WARN_ON_ONCE(!sp))
-		return false;
-
-	return role.word == sp->role.word;
-}
-
 /*
  * Find out if a previously cached root matching the new pgd/role is available,
  * and insert the current root as the MRU in the cache.
@@ -6057,6 +6121,20 @@ static void init_kvm_shadow_mmu(struct kvm_vcpu *vcpu,
 	 * MMU contexts.
 	 */
 	root_role.efer_nx = true;
+
+	/*
+	 * For a guest at hardware CPL3 the root is at the host's paging level,
+	 * because it carries the host's top-level entries, and its role says
+	 * which of the guest's two modes it serves; see kvm_mmu_role_set_user().
+	 */
+	if (shadow_guest_cpl3) {
+		if (root_role.level != HOST_ROOT_LEVEL) {
+			root_role.level = HOST_ROOT_LEVEL;
+			root_role.passthrough = 1;
+		}
+		kvm_mmu_role_set_user(&root_role,
+				      kvm_x86_call(get_cpl)(vcpu) != 0);
+	}
 
 	shadow_mmu_init_context(vcpu, context, root_role);
 }
@@ -7281,6 +7359,7 @@ static void shadow_mmu_split_huge_page(struct kvm *kvm,
 		}
 
 		spte = make_small_spte(kvm, huge_spte, sp->role, index);
+		kvm_mmu_check_leaf_spte(spte);
 		mmu_spte_set(sptep, spte);
 		__rmap_add(kvm, cache, slot, sptep, gfn, sp->role.access);
 	}

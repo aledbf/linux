@@ -63,6 +63,7 @@ KVM_X86_OP_OPTIONAL(flush_remote_tlbs_range)
 #endif
 KVM_X86_OP(flush_tlb_gva)
 KVM_X86_OP(flush_tlb_guest)
+KVM_X86_OP_OPTIONAL_RET0(disallowed_va)
 KVM_X86_OP_OPTIONAL_RET0(vcpu_needs_initialization)
 KVM_X86_OP(vcpu_run)
 KVM_X86_OP(handle_exit)

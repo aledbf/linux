@@ -180,6 +180,8 @@ extern u64 __read_mostly shadow_host_writable_mask;
 extern u64 __read_mostly shadow_mmu_writable_mask;
 extern u64 __read_mostly shadow_nx_mask;
 extern u64 __read_mostly shadow_user_mask;
+extern bool __read_mostly shadow_guest_cpl3;
+extern u64 __read_mostly *shadow_host_root;
 extern u64 __read_mostly shadow_xs_mask; /* mutual exclusive with nx_mask and user_mask */
 extern u64 __read_mostly shadow_xu_mask; /* mutual exclusive with nx_mask and user_mask */
 extern u64 __read_mostly shadow_accessed_mask;
@@ -300,6 +302,24 @@ static inline bool kvm_vcpu_can_access_host_mmio(struct kvm_vcpu *vcpu)
 		return READ_ONCE(root->has_mapped_host_mmio);
 
 	return READ_ONCE(vcpu->kvm->arch.has_mapped_host_mmio);
+}
+
+static inline bool is_root_usable(struct kvm_mmu_root_info *root, gpa_t pgd,
+				  union kvm_mmu_page_role role)
+{
+	struct kvm_mmu_page *sp;
+
+	if (!VALID_PAGE(root->hpa))
+		return false;
+
+	if (!role.direct && pgd != root->pgd)
+		return false;
+
+	sp = root_to_sp(root->hpa);
+	if (WARN_ON_ONCE(!sp))
+		return false;
+
+	return role.word == sp->role.word;
 }
 
 static inline bool is_mmio_spte(struct kvm *kvm, u64 spte)
@@ -558,6 +578,17 @@ static inline u64 get_mmio_spte_generation(u64 spte)
 }
 
 bool spte_needs_atomic_update(u64 spte);
+
+/*
+ * A guest at hardware CPL3 cannot use a leaf SPTE without USER.  make_spte()
+ * sets it; catch a leaf installed by another path, which would otherwise show
+ * up as an endless fault loop.
+ */
+static inline void kvm_mmu_check_leaf_spte(u64 spte)
+{
+	KVM_MMU_WARN_ON(shadow_guest_cpl3 && is_shadow_present_pte(spte) &&
+			!(spte & PT_USER_MASK));
+}
 
 bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
 	       const struct kvm_memory_slot *slot,

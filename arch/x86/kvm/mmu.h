@@ -139,6 +139,23 @@ void kvm_mmu_set_mmio_spte_mask(u64 mmio_value, u64 mmio_mask, u64 access_mask);
 void kvm_mmu_set_mmio_spte_value(struct kvm *kvm, u64 mmio_value);
 void kvm_mmu_set_me_spte_mask(u64 me_value, u64 me_mask);
 void kvm_mmu_set_ept_masks(bool has_ad_bits);
+void kvm_mmu_set_guest_cpl3_paging(u64 *host_root);
+
+/*
+ * For a guest at hardware CPL3, the guest's kernel and user mode each have
+ * their own shadow root for the same guest CR3, told apart only by
+ * ACC_USER_MASK in the role: clear for the kernel's root, set for user's.
+ * The MMU sets it from the CPL when the context is rebuilt; the vendor sets it
+ * when the guest switches mode.
+ */
+static inline void kvm_mmu_role_set_user(union kvm_mmu_page_role *role,
+					 bool user)
+{
+	if (user)
+		role->access |= ACC_USER_MASK;
+	else
+		role->access &= ~ACC_USER_MASK;
+}
 
 void kvm_init_mmu(struct kvm_vcpu *vcpu);
 void kvm_init_shadow_npt_mmu(struct kvm_vcpu *vcpu, unsigned long cr4,

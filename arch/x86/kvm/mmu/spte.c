@@ -31,6 +31,9 @@ u64 __read_mostly shadow_host_writable_mask;
 u64 __read_mostly shadow_mmu_writable_mask;
 u64 __read_mostly shadow_nx_mask;
 u64 __read_mostly shadow_user_mask;
+/* See kvm_mmu_set_guest_cpl3_paging(). */
+bool __read_mostly shadow_guest_cpl3;
+u64 __read_mostly *shadow_host_root;
 u64 __read_mostly shadow_xs_mask; /* mutual exclusive with nx_mask and user_mask */
 u64 __read_mostly shadow_xu_mask; /* mutual exclusive with nx_mask and user_mask */
 u64 __read_mostly shadow_accessed_mask;
@@ -225,6 +228,16 @@ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
 			pte_access &= ~ACC_USER_EXEC_MASK;
 	}
 
+	/*
+	 * SMEP emulated with NX for a CPL3 guest: a user shadow page linked
+	 * beneath a kernel one gets NX on the link (see __link_shadow_page()),
+	 * but a user leaf mapped directly by a kernel shadow page has no such
+	 * link above it, so it carries the NX itself.
+	 */
+	if (shadow_guest_cpl3 && !(sp->role.access & ACC_USER_MASK) &&
+	    (pte_access & ACC_USER_MASK))
+		pte_access &= ~ACC_EXEC_MASK;
+
 	if (pte_access & ACC_READ_MASK)
 		spte |= PT_PRESENT_MASK; /* or VMX_EPT_READABLE_MASK */
 
@@ -239,6 +252,13 @@ bool make_spte(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp,
 		if (pte_access & ACC_USER_EXEC_MASK)
 			spte |= shadow_xu_mask;
 	}
+
+	/*
+	 * A guest at hardware CPL3 can only reach user mappings, whatever its
+	 * own U/S bit says; its kernel/user split is carried by role.access.
+	 */
+	if (shadow_guest_cpl3)
+		spte |= PT_USER_MASK;
 
 	if (level > PG_LEVEL_4K)
 		spte |= PT_PAGE_SIZE_MASK;
@@ -541,6 +561,28 @@ void kvm_mmu_set_ept_masks(bool has_ad_bits)
 }
 EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_mmu_set_ept_masks);
 
+/*
+ * For a vendor whose guests run at hardware CPL3, in both of the guest's own
+ * modes, inside the host's address space, directly on the shadow page tables.
+ *
+ * Every mapping the guest can reach must carry USER, because the hardware will
+ * not let CPL3 touch anything else.  That erases the guest's own U/S bit from
+ * the hardware's view, so SMEP can no longer separate the guest's kernel from
+ * its user space and NX stands in for it: a user shadow page or leaf beneath a
+ * kernel shadow page is made non-executable.  The caller must have refused to
+ * load without NX.
+ *
+ * @host_root is a top-level page table holding the host's kernel mappings.
+ * Its entries are copied into every shadow root, which therefore has the
+ * host's paging level, so that the host stays mapped while the guest runs.
+ */
+void kvm_mmu_set_guest_cpl3_paging(u64 *host_root)
+{
+	shadow_guest_cpl3 = true;
+	shadow_host_root = host_root;
+}
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(kvm_mmu_set_guest_cpl3_paging);
+
 void kvm_mmu_reset_all_pte_masks(void)
 {
 	u8 low_phys_bits;
@@ -573,6 +615,8 @@ void kvm_mmu_reset_all_pte_masks(void)
 		GENMASK_ULL(low_phys_bits - 1, PAGE_SHIFT);
 
 	shadow_user_mask	= PT_USER_MASK;
+	shadow_guest_cpl3	= false;
+	shadow_host_root	= NULL;
 	shadow_accessed_mask	= PT_ACCESSED_MASK;
 	shadow_dirty_mask	= PT_DIRTY_MASK;
 	shadow_nx_mask		= PT64_NX_MASK;

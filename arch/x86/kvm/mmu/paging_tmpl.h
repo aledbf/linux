@@ -355,6 +355,13 @@ retry_walk:
 			goto error;
 		--walker->level;
 	}
+
+	/*
+	 * Let the vendor refuse addresses the guest may not map at all, e.g.
+	 * the host's half of a root that carries the host's mappings.
+	 */
+	if (kvm_x86_call(disallowed_va)(vcpu, addr))
+		goto error;
 #endif
 	walker->max_level = walker->level;
 
@@ -697,6 +704,8 @@ static int FNAME(fetch)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault,
 
 		table_gfn = gw->table_gfn[it.level - 2];
 		access = gw->pt_access[it.level - 2];
+		access = mmu_adjust_kernel_only_access(vcpu, it.sptep, access,
+						     direct_access);
 		sp = kvm_mmu_get_child_sp(vcpu, it.sptep, table_gfn,
 					  false, access);
 
@@ -997,6 +1006,7 @@ static int FNAME(sync_spte)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp, int 
 	make_spte(vcpu, sp, slot, pte_access, gfn,
 		  spte_to_pfn(spte), spte, true, true,
 		  host_writable, &spte);
+	kvm_mmu_check_leaf_spte(spte);
 
 	/*
 	 * There is no need to mark the pfn dirty, as the new protections must
