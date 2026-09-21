@@ -2110,6 +2110,11 @@ bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
 	if (vcpu->arch.cpuid_dynamic_bits_dirty)
 		kvm_update_cpuid_runtime(vcpu);
 
+	if (kvm_x86_call(get_fixed_cpuid)(vcpu, function, eax, ebx, ecx, edx)) {
+		exact = true;
+		goto out;
+	}
+
 	entry = kvm_find_cpuid_entry_index(vcpu, function, index);
 	exact = !!entry;
 
@@ -2150,6 +2155,7 @@ bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
 			}
 		}
 	}
+out:
 	trace_kvm_cpuid(orig_function, index, *eax, *ebx, *ecx, *edx, exact,
 			used_max_basic);
 	return exact;

@@ -1532,6 +1532,14 @@ struct kvm_x86_ops {
 	void (*hardware_unsetup)(void);
 	bool (*has_emulated_msr)(struct kvm *kvm, u32 index);
 	void (*vcpu_after_set_cpuid)(struct kvm_vcpu *vcpu);
+	/*
+	 * Return true and fill the registers for a CPUID leaf whose contents
+	 * the vendor defines itself, whatever the guest's CPUID table says.
+	 * Optional: for a vendor without it the static call site is patched
+	 * to return false without a call.
+	 */
+	bool (*get_fixed_cpuid)(struct kvm_vcpu *vcpu, u32 function,
+				u32 *eax, u32 *ebx, u32 *ecx, u32 *edx);
 
 	unsigned int vm_size;
 	int (*vm_init)(struct kvm *kvm);
