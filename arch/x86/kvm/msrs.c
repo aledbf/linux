@@ -426,28 +426,9 @@ static bool kvm_is_advertised_msr(u32 msr_index)
 }
 
 
-/*
- * Some IA32_ARCH_CAPABILITIES bits have dependencies on MSRs that KVM
- * does not yet virtualize. These include:
- *   10 - MISC_PACKAGE_CTRLS
- *   11 - ENERGY_FILTERING_CTL
- *   12 - DOITM
- *   18 - FB_CLEAR_CTRL
- *   21 - XAPIC_DISABLE_STATUS
- *   23 - OVERCLOCKING_STATUS
- */
-
-#define KVM_SUPPORTED_ARCH_CAP \
-	(ARCH_CAP_RDCL_NO | ARCH_CAP_IBRS_ALL | ARCH_CAP_RSBA | \
-	 ARCH_CAP_SKIP_VMENTRY_L1DFLUSH | ARCH_CAP_SSB_NO | ARCH_CAP_MDS_NO | \
-	 ARCH_CAP_PSCHANGE_MC_NO | ARCH_CAP_TSX_CTRL_MSR | ARCH_CAP_TAA_NO | \
-	 ARCH_CAP_SBDR_SSDP_NO | ARCH_CAP_FBSDP_NO | ARCH_CAP_PSDP_NO | \
-	 ARCH_CAP_FB_CLEAR | ARCH_CAP_RRSBA | ARCH_CAP_PBRSB_NO | ARCH_CAP_GDS_NO | \
-	 ARCH_CAP_RFDS_NO | ARCH_CAP_RFDS_CLEAR | ARCH_CAP_BHI_NO | ARCH_CAP_ITS_NO)
-
 u64 kvm_get_arch_capabilities(void)
 {
-	u64 data = kvm_host.arch_capabilities & KVM_SUPPORTED_ARCH_CAP;
+	u64 data = kvm_host.arch_capabilities & kvm_caps.supported_arch_cap;
 
 	/*
 	 * If nx_huge_pages is enabled, KVM's shadow paging will ensure that
@@ -502,7 +483,8 @@ u64 kvm_get_arch_capabilities(void)
 	if (!boot_cpu_has_bug(X86_BUG_GDS) || gds_ucode_mitigated())
 		data |= ARCH_CAP_GDS_NO;
 
-	return data;
+	/* The bits synthesized above are subject to the vendor's mask too. */
+	return data & kvm_caps.supported_arch_cap;
 }
 
 static int kvm_get_feature_msr(struct kvm_vcpu *vcpu, u32 index, u64 *data,
@@ -1472,6 +1454,13 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		if (!msr_info->host_initiated ||
 		    !guest_cpu_cap_has(vcpu, X86_FEATURE_ARCH_CAPABILITIES))
 			return KVM_MSR_RET_UNSUPPORTED;
+		/*
+		 * Userspace may set bits the host does not have, e.g. for
+		 * migration, but not bits the vendor module has taken out of
+		 * KVM_SUPPORTED_ARCH_CAP because it cannot honour them.
+		 */
+		if (data & KVM_SUPPORTED_ARCH_CAP & ~kvm_caps.supported_arch_cap)
+			return 1;
 		vcpu->arch.arch_capabilities = data;
 		break;
 	case MSR_IA32_PERF_CAPABILITIES:

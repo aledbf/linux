@@ -273,6 +273,13 @@ struct kvm_caps {
 	u64 supported_xcr0;
 	u64 supported_xss;
 	u64 supported_perf_cap;
+	/*
+	 * MSR_IA32_ARCH_CAPABILITIES bits that may be advertised to a guest,
+	 * whether passed through from the host or synthesized by KVM.
+	 * Defaults to KVM_SUPPORTED_ARCH_CAP, vendor hardware_setup() may
+	 * clear bits it cannot honour, which userspace then cannot set.
+	 */
+	u64 supported_arch_cap;
 
 	u64 supported_efer_bits;
 
