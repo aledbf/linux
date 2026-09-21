@@ -126,6 +126,8 @@
 	KVM_ARCH_REQ_FLAGS(33, KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
 #define KVM_REQ_UPDATE_PROTECTED_GUEST_STATE \
 	KVM_ARCH_REQ_FLAGS(34, KVM_REQUEST_WAIT)
+#define KVM_REQ_PINNED_PAGES_RELOAD \
+	KVM_ARCH_REQ_FLAGS(35, KVM_REQUEST_WAIT | KVM_REQUEST_NO_WAKEUP)
 
 #define INVALID_PAGE (~(hpa_t)0)
 #define VALID_PAGE(x) ((x) != INVALID_PAGE)
@@ -1763,6 +1765,13 @@ struct kvm_x86_ops {
 	void (*gmem_invalidate_range)(struct kvm *kvm, struct kvm_gfn_range *range);
 #endif
 	int (*gmem_max_mapping_level)(struct kvm *kvm, kvm_pfn_t pfn, bool is_private);
+
+	/*
+	 * For a vendor that keeps guest pages pinned outside the MMU: resolve
+	 * them again after a memslot was moved or deleted.  Serviced before
+	 * the next VM entry.
+	 */
+	void (*reload_pinned_pages)(struct kvm_vcpu *vcpu);
 };
 
 struct kvm_x86_nested_ops {

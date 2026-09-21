@@ -7718,6 +7718,9 @@ void kvm_arch_flush_shadow_memslot(struct kvm *kvm,
 
 	if (zap_all)
 		__kvm_mmu_zap_all_fast_back_half(kvm);
+
+	if (kvm_x86_ops.reload_pinned_pages)
+		kvm_make_all_cpus_request(kvm, KVM_REQ_PINNED_PAGES_RELOAD);
 }
 
 void kvm_mmu_invalidate_mmio_sptes(struct kvm *kvm, u64 gen)
