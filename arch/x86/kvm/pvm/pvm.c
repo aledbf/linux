@@ -602,6 +602,26 @@ struct pvm_asid_data {
 
 static DEFINE_PER_CPU(struct pvm_asid_data, pvm_asid);
 
+static void update_asid(struct vcpu_pvm *pvm)
+{
+	struct pvm_asid_data *asid_data = this_cpu_ptr(&pvm_asid);
+
+	if (pvm->asid_generation == asid_data->asid_generation)
+		return;
+
+	if (asid_data->next_asid > asid_data->max_asid) {
+		++asid_data->asid_generation;
+		if (!asid_data->asid_generation)
+			asid_data->asid_generation = PVM_ASID_GEN_INIT;
+		asid_data->next_asid = asid_data->min_asid;
+		__flush_tlb_all();
+	}
+
+	pvm->asid_generation = asid_data->asid_generation;
+	pvm->asid = asid_data->next_asid++;
+	pvm->flush_hwtlb_current = false;
+}
+
 static bool is_asid_clean(struct vcpu_pvm *pvm)
 {
 	struct pvm_asid_data *asid_data = this_cpu_ptr(&pvm_asid);
@@ -675,6 +695,87 @@ static void pvm_flush_hwtlb_gva(struct kvm_vcpu *vcpu, gva_t addr, bool *full)
 		pvm_flush_hwtlb_root_gva(pvm, &mmu->prev_roots[i], addr);
 
 	put_cpu();
+}
+
+static u64 get_switch_hw_cr3(struct vcpu_pvm *pvm)
+{
+	struct kvm_mmu *mmu = pvm->vcpu.arch.mmu;
+	union kvm_mmu_page_role switch_role = mmu->root_role;
+	int i;
+
+	kvm_mmu_role_set_user(&switch_role, is_smod(pvm));
+	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++) {
+		if (is_root_usable(&mmu->prev_roots[i], pvm->vcpu.arch.cr3, switch_role)) {
+			if (i != 0)
+				swap(mmu->prev_roots[0], mmu->prev_roots[i]);
+			return __sme_set(mmu->prev_roots[0].hpa);
+		}
+	}
+
+	return INVALID_PAGE;
+}
+
+static void pvm_set_host_cr3_for_guest(struct vcpu_pvm *pvm)
+{
+	u64 hw_cr3 = __sme_set(pvm->vcpu.arch.mmu->root.hpa);
+	u64 switch_hw_cr3 = get_switch_hw_cr3(pvm);
+	u64 enter_cr3 = hw_cr3;
+	u32 pcid = pvm->vcpu.arch.cr3 & X86_CR3_PCID_MASK;
+
+	update_asid(pvm);
+
+	pcid = guest_pcid_to_host_pcid(pvm, pcid, is_smod(pvm));
+	hw_cr3 |= pcid | CR3_NOFLUSH;
+	if (switch_hw_cr3 != INVALID_PAGE)
+		switch_hw_cr3 |= (pcid ^ PVM_UMOD_PCID_MASK) | CR3_NOFLUSH;
+
+	enter_cr3 |= pcid;
+	if (!pvm->flush_hwtlb_current)
+		enter_cr3 |= CR3_NOFLUSH;
+	pvm->flush_hwtlb_current = false;
+
+	/*
+	 * if guest PCID is bigger than 7, use the fallback guest PCID 0, which
+	 * is assumed to always be force flushed.
+	 */
+	if (unlikely(!(pcid & PVM_GUEST_PCID_INDEX_MASK))) {
+		enter_cr3 &= ~CR3_NOFLUSH;
+		hw_cr3 &= ~CR3_NOFLUSH;
+		if (switch_hw_cr3 != INVALID_PAGE)
+			switch_hw_cr3 &= ~CR3_NOFLUSH;
+	}
+
+	this_cpu_write(cpu_tss_rw.tss_ex.enter_cr3, enter_cr3);
+
+	if (is_smod(pvm)) {
+		this_cpu_write(cpu_tss_rw.tss_ex.smod_cr3, hw_cr3);
+		this_cpu_write(cpu_tss_rw.tss_ex.umod_cr3, switch_hw_cr3);
+	} else {
+		this_cpu_write(cpu_tss_rw.tss_ex.umod_cr3, hw_cr3);
+		this_cpu_write(cpu_tss_rw.tss_ex.smod_cr3, switch_hw_cr3);
+	}
+
+	if (switch_hw_cr3 != INVALID_PAGE)
+		pvm->switch_flags &= ~SWITCH_FLAGS_NO_DS_CR3;
+	else
+		pvm->switch_flags |= SWITCH_FLAGS_NO_DS_CR3;
+}
+
+static void pvm_set_host_cr3_for_hypervisor(struct vcpu_pvm *pvm)
+{
+	this_cpu_write(cpu_tss_rw.tss_ex.host_cr3,
+		       __get_current_cr3_fast() | X86_CR3_PCID_NOFLUSH);
+}
+
+/*
+ * Set tss_ex.host_cr3 for the exit, tss_ex.enter_cr3 for the entry, and
+ * tss_ex.smod_cr3 and tss_ex.umod_cr3, setting or clearing
+ * SWITCH_FLAGS_NO_DS_CR3, for direct switching.
+ */
+static void pvm_set_host_cr3(struct vcpu_pvm *pvm)
+{
+	pvm_set_host_cr3_for_hypervisor(pvm);
+	pvm_set_host_cr3_for_guest(pvm);
 }
 
 static void pvm_load_mmu_pgd(struct kvm_vcpu *vcpu, hpa_t root_hpa,
@@ -2584,6 +2685,376 @@ static __always_inline unsigned long pvm_eff_dr7(struct kvm_vcpu *vcpu)
 	return eff_dr7;
 }
 
+/* Save the guest registers from the host sp0 or IST stack. */
+static __always_inline void save_regs(struct kvm_vcpu *vcpu, struct pt_regs *guest)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	vcpu->arch.regs[VCPU_REGS_RAX] = guest->ax;
+	vcpu->arch.regs[VCPU_REGS_RCX] = guest->cx;
+	vcpu->arch.regs[VCPU_REGS_RDX] = guest->dx;
+	vcpu->arch.regs[VCPU_REGS_RBX] = guest->bx;
+	vcpu->arch.regs[VCPU_REGS_RSP] = guest->sp;
+	vcpu->arch.regs[VCPU_REGS_RBP] = guest->bp;
+	vcpu->arch.regs[VCPU_REGS_RSI] = guest->si;
+	vcpu->arch.regs[VCPU_REGS_RDI] = guest->di;
+	vcpu->arch.regs[VCPU_REGS_R8] = guest->r8;
+	vcpu->arch.regs[VCPU_REGS_R9] = guest->r9;
+	vcpu->arch.regs[VCPU_REGS_R10] = guest->r10;
+	vcpu->arch.regs[VCPU_REGS_R11] = guest->r11;
+	vcpu->arch.regs[VCPU_REGS_R12] = guest->r12;
+	vcpu->arch.regs[VCPU_REGS_R13] = guest->r13;
+	vcpu->arch.regs[VCPU_REGS_R14] = guest->r14;
+	vcpu->arch.regs[VCPU_REGS_R15] = guest->r15;
+	vcpu->arch.regs[VCPU_REG_RIP] = guest->ip;
+	pvm->rflags = guest->flags;
+	pvm->hw_cs = guest->cs;
+	pvm->hw_ss = guest->ss;
+}
+
+/* Load the guest registers onto the host sp0 stack. */
+static __always_inline void load_regs(struct kvm_vcpu *vcpu, struct pt_regs *guest)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	guest->ss = pvm->hw_ss;
+	guest->sp = vcpu->arch.regs[VCPU_REGS_RSP];
+	guest->flags = (pvm->rflags & SWITCH_ENTER_EFLAGS_ALLOWED) | SWITCH_ENTER_EFLAGS_FIXED;
+	guest->cs = pvm->hw_cs;
+	guest->ip = vcpu->arch.regs[VCPU_REG_RIP];
+	guest->orig_ax = -1;
+	guest->di = vcpu->arch.regs[VCPU_REGS_RDI];
+	guest->si = vcpu->arch.regs[VCPU_REGS_RSI];
+	guest->dx = vcpu->arch.regs[VCPU_REGS_RDX];
+	guest->cx = vcpu->arch.regs[VCPU_REGS_RCX];
+	guest->ax = vcpu->arch.regs[VCPU_REGS_RAX];
+	guest->r8 = vcpu->arch.regs[VCPU_REGS_R8];
+	guest->r9 = vcpu->arch.regs[VCPU_REGS_R9];
+	guest->r10 = vcpu->arch.regs[VCPU_REGS_R10];
+	guest->r11 = vcpu->arch.regs[VCPU_REGS_R11];
+	guest->bx = vcpu->arch.regs[VCPU_REGS_RBX];
+	guest->bp = vcpu->arch.regs[VCPU_REGS_RBP];
+	guest->r12 = vcpu->arch.regs[VCPU_REGS_R12];
+	guest->r13 = vcpu->arch.regs[VCPU_REGS_R13];
+	guest->r14 = vcpu->arch.regs[VCPU_REGS_R14];
+	guest->r15 = vcpu->arch.regs[VCPU_REGS_R15];
+}
+
+static noinstr void pvm_vcpu_run_noinstr(struct kvm_vcpu *vcpu)
+{
+	struct tss_extra *tss_ex = this_cpu_ptr(&cpu_tss_rw.tss_ex);
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	struct pt_regs *sp0_regs = (struct pt_regs *)this_cpu_read(cpu_tss_rw.x86_tss.sp0) - 1;
+	struct pt_regs *ret_regs;
+
+	guest_state_enter_irqoff();
+
+	load_regs(vcpu, sp0_regs);
+
+	/* The state the switcher needs for direct switching. */
+	tss_ex->switch_flags = pvm->switch_flags;
+	tss_ex->pvcs = pvm->pvcs;
+	tss_ex->retu_rip = pvm->msr_retu_rip_plus2;
+	tss_ex->smod_entry = pvm->msr_lstar;
+	tss_ex->smod_gsbase = pvm->msr_kernel_gs_base;
+	tss_ex->pku_on = pvm_guest_uses_pku(vcpu);
+	tss_ex->smod_pkru = pvm->smod_pkru;
+
+	if (unlikely(pvm->guest_dr7 & DR7_BP_EN_MASK))
+		set_debugreg(pvm_eff_dr7(vcpu), 7);
+
+	ret_regs = switcher_enter_guest();
+
+	/* The mode the guest left in. */
+	pvm->switch_flags = tss_ex->switch_flags;
+
+	save_regs(vcpu, ret_regs);
+	pvm->exit_vector = (ret_regs->orig_ax >> 32);
+	pvm->exit_error_code = (u32)ret_regs->orig_ax;
+
+	/* DR7 has to be zero when the debug registers go back to the host. */
+	if (unlikely(pvm->guest_dr7 & DR7_BP_EN_MASK))
+		set_debugreg(0, 7);
+
+	/* What has to be collected before instrumentation is allowed. */
+	switch (pvm->exit_vector) {
+	case PF_VECTOR:
+		/* CR2, and whether this is an async #PF from the host. */
+		pvm->exit_cr2 = read_cr2();
+		vcpu->arch.apf.host_apf_flags = kvm_read_and_reset_apf_flags();
+		break;
+	case NMI_VECTOR:
+		x86_entry_from_kvm(EVENT_TYPE_NMI, NMI_VECTOR);
+		break;
+	case DB_VECTOR:
+		get_debugreg(pvm->exit_dr6, 6);
+		set_debugreg(DR6_RESERVED, 6);
+		break;
+	case NM_VECTOR:
+		if (vcpu->arch.guest_fpu.fpstate->xfd)
+			rdmsrq(MSR_IA32_XFD_ERR, vcpu->arch.guest_fpu.xfd_err);
+		break;
+	default:
+		break;
+	}
+
+	guest_state_exit_irqoff();
+}
+
+/*
+ * PVM wrappers for kvm_load_{guest|host}_xsave_state().
+ *
+ * There is one hardware PKRU and the guest runs at CPL 3 under the host's
+ * CR4.PKE, so it applies to every guest access -- and PVM needs it to be three
+ * things: the host's while the host runs, the guest's user value while the
+ * guest is in user mode, and a value of the hypervisor's choosing while the
+ * guest is in supervisor mode.  That last one is not an optimisation: every
+ * leaf SPTE carries USER, as CPL3 needs, so without it the guest's own PKRU
+ * would govern its kernel's accesses, where real hardware exempts supervisor
+ * pages from PKU entirely.
+ *
+ * The core brackets ->vcpu_run() with kvm_load_guest_pkru() and
+ * kvm_load_host_pkru(), which handle the outer two: they load
+ * vcpu->arch.pkru on the way in and capture it back with rdpkru() on the way
+ * out.  So vcpu->arch.pkru is the guest's *user* PKRU, which is also what
+ * KVM_GET_XSAVE hands the VMM and what a migration stream carries.
+ *
+ * These two add the inner one.  Entering in supervisor mode the register has
+ * to hold smod_pkru rather than what the core just loaded; leaving supervisor
+ * mode it has to hold the user value again before the core reads it, or the
+ * guest's architectural PKRU would silently become the supervisor constant.
+ * PVCS::pkru is where the user value sits while the guest is in supervisor
+ * mode, which is what the ABI says it is for, and what the guest kernel writes
+ * when it wants a different PKRU for the task it is returning to.
+ *
+ * A guest that has not enabled protection keys gets none of this: the core
+ * skips its half, and PVM forces PKRU to 0 so that a host process with a
+ * restrictive PKRU -- init_pkru on Linux, which is every process -- cannot
+ * deny the guest access to its own pages.
+ */
+static inline void pvm_load_guest_xsave_state(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	if (!cpu_feature_enabled(X86_FEATURE_PKU))
+		return;
+
+	if (!pvm_guest_uses_pku(vcpu)) {
+		if (vcpu->arch.host_pkru)
+			write_pkru(0);
+		return;
+	}
+
+	if (is_smod(pvm))
+		write_pkru(pvm->smod_pkru);
+}
+
+static inline void pvm_load_host_xsave_state(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	if (!cpu_feature_enabled(X86_FEATURE_PKU))
+		return;
+
+	if (!pvm_guest_uses_pku(vcpu)) {
+		if (rdpkru() != vcpu->arch.host_pkru)
+			write_pkru(vcpu->arch.host_pkru);
+		return;
+	}
+
+	/*
+	 * Leaving supervisor mode, so what the core is about to read is
+	 * smod_pkru.  Put the guest's user value back first.  Without a PVCS
+	 * there is nowhere it could have been parked and nothing to restore --
+	 * such a guest has no user mode to return to either.
+	 */
+	if (is_smod(pvm) && pvm->pvcs)
+		write_pkru(pvm->pvcs->pkru);
+}
+
+static fastpath_t pvm_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	bool is_smod_before_run = is_smod(pvm);
+
+	/*
+	 * Don't enter the guest if its state is invalid: the exit handler
+	 * emulates until it is back in a valid state.
+	 */
+	if (unlikely(pvm->non_pvm_mode))
+		goto not_entered;
+
+	/*
+	 * A PVCS that failed to pin is re-pinned, or the vCPU has a triple
+	 * fault pending, before the guest can be entered.
+	 */
+	if (WARN_ON_ONCE(!pvm->pvcs && pvm->msr_vcpu_struct)) {
+		kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+		goto not_entered;
+	}
+
+	trace_kvm_entry(vcpu, false);
+
+	pvm_load_guest_xsave_state(vcpu);
+
+	kvm_wait_lapic_expire(vcpu);
+
+	pvm_set_host_cr3(pvm);
+
+	/*
+	 * PVCS::cr2 is the guest's CR2 while it runs (see the PVM spec).  The
+	 * hypervisor's value may have changed since the last exit -- a #PF
+	 * delivered, KVM_SET_SREGS, the emulator -- so put it there on every
+	 * entry; the exit below takes it back.
+	 */
+	if (likely(pvm->pvcs))
+		pvm->pvcs->cr2 = vcpu->arch.cr2;
+
+	if (pvm->host_debugctlmsr)
+		update_debugctlmsr(0);
+
+	pvm_vcpu_run_noinstr(vcpu);
+
+	if (is_smod_before_run != is_smod(pvm)) {
+		kvm_mmu_role_set_user(&vcpu->arch.mmu->root_role, !is_smod(pvm));
+		swap(pvm->vcpu.arch.mmu->root, pvm->vcpu.arch.mmu->prev_roots[0]);
+	}
+
+	/*
+	 * The guest's own writes put its CR2 into the PVCS, which
+	 * vcpu->arch.cr2 would otherwise never hear of.  Take it back on every
+	 * exit.
+	 */
+	if (likely(pvm->pvcs))
+		vcpu->arch.cr2 = READ_ONCE(pvm->pvcs->cr2);
+
+	/* MSR_IA32_DEBUGCTLMSR is zeroed before vmenter. Restore it if needed */
+	if (pvm->host_debugctlmsr)
+		update_debugctlmsr(pvm->host_debugctlmsr);
+
+	if (is_smod(pvm)) {
+		struct pvm_vcpu_struct *pvcs = pvm->pvcs;
+
+		/*
+		 * Load the X86_EFLAGS_IF bit from PVCS. In user mode, the
+		 * Interrupt Flag is considered to be set and cannot be
+		 * changed. Since it is already set in 'pvm->rflags', so
+		 * nothing to do. In supervisor mode, the Interrupt Flag is
+		 * reflected in 'pvcs->event_flags' and can be changed
+		 * directly without triggering a VM exit.
+		 */
+		pvm->rflags &= ~X86_EFLAGS_IF;
+		static_assert(PVM_EVENT_FLAGS_IF == X86_EFLAGS_IF);
+		if (likely(pvm->msr_vcpu_struct))
+			pvm->rflags |= X86_EFLAGS_IF & pvcs->event_flags;
+
+		if (pvm->hw_cs != __USER_CS || pvm->hw_ss != __USER_DS)
+			kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+	}
+
+	pvm_load_host_xsave_state(vcpu);
+
+	trace_kvm_exit(vcpu, KVM_ISA_PVM);
+
+	return EXIT_FASTPATH_NONE;
+
+not_entered:
+	/*
+	 * The exit handlers run anyway.  Leave them an exit that is not the
+	 * previous one: a stale external interrupt vector would have
+	 * pvm_handle_exit_irqoff() run the host's handler for it again.
+	 */
+	pvm->exit_vector = PVM_FAILED_VMENTRY_VECTOR;
+	return EXIT_FASTPATH_NONE;
+}
+
+static void pvm_reset_segment(struct kvm_segment *var, int seg)
+{
+	memset(var, 0, sizeof(*var));
+	var->limit = 0xffff;
+	var->present = 1;
+
+	switch (seg) {
+	case VCPU_SREG_CS:
+		var->s = 1;
+		var->type = 0xb; /* Code Segment */
+		var->selector = 0xf000;
+		var->base = 0xffff0000;
+		break;
+	case VCPU_SREG_LDTR:
+		var->s = 0;
+		var->type = DESC_LDT;
+		break;
+	case VCPU_SREG_TR:
+		var->s = 0;
+		var->type = DESC_TSS | 0x2; /* 32-bit TSS, busy */
+		break;
+	default:
+		var->s = 1;
+		var->type = 3; /* Read/Write Data Segment */
+		break;
+	}
+}
+
+static void __pvm_vcpu_reset(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	if (is_intel)
+		vcpu->arch.microcode_version = 0x100000000ULL;
+	else
+		vcpu->arch.microcode_version = 0x01000065;
+
+	pvm->msr_ia32_feature_control_valid_bits = FEAT_CTL_LOCKED;
+}
+
+static void pvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	int i;
+
+	pvm_switch_to_host(pvm);
+
+	pvm_unpin_vcpu_struct(pvm);
+
+	if (!init_event)
+		__pvm_vcpu_reset(vcpu);
+
+	/*
+	 * For PVM, cpuid faulting relies on hardware capability, but it is set
+	 * as supported by default in kvm_arch_vcpu_create(). Therefore, it
+	 * should be cleared if the host doesn't support it.
+	 */
+	if (!boot_cpu_has(X86_FEATURE_CPUID_FAULT))
+		vcpu->arch.msr_platform_info &= ~MSR_PLATFORM_INFO_CPUID_FAULT;
+
+	/* Non-PVM mode */
+	pvm->non_pvm_mode = true;
+	pvm->msr_star = 0;
+
+	/* x86 state */
+	for (i = 0; i < ARRAY_SIZE(pvm->segments); i++)
+		pvm_reset_segment(&pvm->segments[i], i);
+	kvm_set_cr8(vcpu, 0);
+	pvm->idt_ptr.address = 0;
+	pvm->idt_ptr.size = 0xffff;
+	pvm->gdt_ptr.address = 0;
+	pvm->gdt_ptr.size = 0xffff;
+
+	/* PVM state */
+	pvm->switch_flags = SWITCH_FLAGS_INIT;
+	pvm->hw_cs = __USER_CS;
+	pvm->hw_ss = __USER_DS;
+	pvm->int_shadow = 0;
+	pvm->nmi_mask = false;
+	memset(&pvm->tls_array[0], 0, sizeof(pvm->tls_array));
+
+	pvm->msr_vcpu_struct = 0;
+	pvm->msr_event_entry = 0;
+	pvm->msr_retu_rip_plus2 = 0;
+	pvm->msr_features_enabled = 0;
+}
+
 static int pvm_vcpu_create(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_pvm *pvm = to_pvm(vcpu);
@@ -2980,6 +3451,7 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 
 	.vcpu_create = pvm_vcpu_create,
 	.vcpu_free = pvm_vcpu_free,
+	.vcpu_reset = pvm_vcpu_reset,
 
 	.prepare_switch_to_guest = pvm_prepare_switch_to_guest,
 	.vcpu_load = pvm_vcpu_load,
@@ -3018,6 +3490,7 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.flush_tlb_gva = pvm_flush_hwtlb_gva,
 	.flush_tlb_guest = pvm_flush_hwtlb,
 
+	.vcpu_run = pvm_vcpu_run,
 	.handle_exit = pvm_handle_exit,
 	.skip_emulated_instruction = pvm_skip_emulated_instruction,
 	.set_interrupt_shadow = pvm_set_interrupt_shadow,
@@ -3166,12 +3639,6 @@ static int __init pvm_check_confidential_host(void)
 static int __init pvm_init(void)
 {
 	int r;
-
-	/*
-	 * Not every operation a vendor module has to provide is in place yet,
-	 * so refuse to load.
-	 */
-	return -EOPNOTSUPP;
 
 	r = pvm_check_confidential_host();
 	if (r)
