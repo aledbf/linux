@@ -91,7 +91,7 @@ unsigned long __init __startup_64(unsigned long p2v_offset,
 	unsigned long physaddr = (unsigned long)rip_rel_ptr(_text);
 	unsigned long va_text, va_end;
 	unsigned long pgtable_flags;
-	unsigned long load_delta;
+	unsigned long load_delta, reloc_delta;
 	pgdval_t *pgd;
 	p4dval_t *p4d;
 	pudval_t *pud;
@@ -108,8 +108,13 @@ unsigned long __init __startup_64(unsigned long p2v_offset,
 	/*
 	 * Compute the delta between the address I am compiled to run at
 	 * and the address I am actually running at.
+	 *
+	 * load_delta cancels the relocation already applied to entries built
+	 * as sym - __START_KERNEL_map; phys_base is the physical load address.
+	 * They differ only when the kernel has relocated itself away from
+	 * __START_KERNEL_map.
 	 */
-	phys_base = load_delta = __START_KERNEL_map + p2v_offset;
+	load_delta = __START_KERNEL_map + p2v_offset;
 
 	/* Is the address not 2M aligned? */
 	if (load_delta & ~PMD_MASK)
@@ -117,6 +122,9 @@ unsigned long __init __startup_64(unsigned long p2v_offset,
 
 	va_text = physaddr - p2v_offset;
 	va_end  = (unsigned long)rip_rel_ptr(_end) - p2v_offset;
+
+	reloc_delta = (va_text & PUD_MASK) - __START_KERNEL_map;
+	phys_base = load_delta + reloc_delta;
 
 	/* Include the SME encryption mask in the fixup value */
 	load_delta += sme_get_me_mask();
@@ -135,6 +143,31 @@ unsigned long __init __startup_64(unsigned long p2v_offset,
 
 	level3_kernel_pgt[PTRS_PER_PUD - 2].pud += load_delta;
 	level3_kernel_pgt[PTRS_PER_PUD - 1].pud += load_delta;
+
+	/*
+	 * A kernel that relocated itself has to be in the last two PUD entries
+	 * of its PGD entry (with 5-level paging, of P4D entry 511), like at
+	 * __START_KERNEL_map, so that only the PGD entry moves.  That entry must
+	 * not be one of the two the identity mapping below takes.  See
+	 * KERNEL_MAP_BASE.
+	 */
+	if (IS_ENABLED(CONFIG_X86_PIE) && reloc_delta) {
+		unsigned int ident = (physaddr >> PGDIR_SHIFT) % PTRS_PER_PGD;
+
+		i = pgd_index(va_text);
+		if (pud_index(va_text) != PTRS_PER_PUD - 2 ||
+		    (la57 && p4d_index(va_text) != MAX_PTRS_PER_P4D - 1) ||
+		    i == ident || i == ident + 1) {
+			/* There is no way to report this so early. */
+			for (;;)
+				;
+		}
+
+		pgd[i] = pgd[pgd_index(__START_KERNEL_map)];
+		pgd[pgd_index(__START_KERNEL_map)] = 0;
+
+		kernel_map_base = va_text & PUD_MASK;
+	}
 
 	for (i = FIXMAP_PMD_TOP; i > FIXMAP_PMD_TOP - FIXMAP_PMD_NUM; i--)
 		level2_fixmap_pgt[i].pmd += load_delta;
@@ -204,10 +237,14 @@ unsigned long __init __startup_64(unsigned long p2v_offset,
 	for (i = 0; i < pmd_index(va_text); i++)
 		pmd[i] &= ~_PAGE_PRESENT;
 
-	/* fixup pages that are part of the kernel image */
+	/*
+	 * Fixup pages that are part of the kernel image.  level2_kernel_pgt is
+	 * built from plain constants that carry no relocation, so it takes
+	 * phys_base rather than load_delta.
+	 */
 	for (; i <= pmd_index(va_end); i++)
 		if (pmd[i] & _PAGE_PRESENT)
-			pmd[i] += load_delta;
+			pmd[i] += phys_base + sme_get_me_mask();
 
 	/* invalidate pages after the kernel image */
 	for (; i < PTRS_PER_PMD; i++)

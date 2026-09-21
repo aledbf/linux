@@ -62,8 +62,8 @@ extern unsigned long kernel_map_base;
  *    __phys_addr() and __virt_addr_valid() take any address below it for a
  *    direct mapping address.
  *
- * cleanup_highmap() checks the last two, once the layout of the kernel half
- * is final.
+ * __startup_64() checks the first two, cleanup_highmap() the others once the
+ * layout of the kernel half is final.
  */
 #ifdef CONFIG_X86_PIE
 #define KERNEL_MAP_BASE		kernel_map_base

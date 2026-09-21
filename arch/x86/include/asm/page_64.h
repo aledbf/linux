@@ -13,6 +13,10 @@
 
 /* duplicated to the one in bootmem.h */
 extern unsigned long max_pfn;
+/*
+ * The physical address KERNEL_MAP_BASE maps to, so that a kernel image
+ * address x is at physical address x - KERNEL_MAP_BASE + phys_base.
+ */
 extern unsigned long phys_base;
 
 extern unsigned long page_offset_base;
