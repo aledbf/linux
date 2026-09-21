@@ -39,6 +39,340 @@ module_param_named(cpuid_intercept, enable_cpuid_intercept, bool, 0444);
 
 static bool __read_mostly is_intel;
 
+/*
+ * desc.h only defines load_ldt() for !PARAVIRT_XXL, and restoring the host's
+ * LDT after a guest exit is not a paravirt operation.
+ */
+static __always_inline void pvm_load_ldt(u16 sel)
+{
+	asm volatile("lldt %0" : : "rm" (sel));
+}
+
+static inline bool is_smod(struct vcpu_pvm *pvm)
+{
+	unsigned long switch_flags = pvm->switch_flags;
+
+	if ((switch_flags & SWITCH_FLAGS_MOD_TOGGLE) == SWITCH_FLAGS_SMOD)
+		return true;
+
+	WARN_ON_ONCE((switch_flags & SWITCH_FLAGS_MOD_TOGGLE) != SWITCH_FLAGS_UMOD);
+	return false;
+}
+
+static inline void pvm_switch_flags_toggle_mod(struct vcpu_pvm *pvm)
+{
+	pvm->switch_flags ^= SWITCH_FLAGS_MOD_TOGGLE;
+}
+
+/*
+ * The selectors MSR_STAR describes: kernel CS in bits 47:32 with RPL 0 and
+ * kernel DS after it, 32-bit user CS in bits 63:48 with RPL 3 and 64-bit user
+ * CS 16 after that.
+ */
+static inline u16 kernel_cs_by_msr(u64 msr_star)
+{
+	return ((msr_star >> 32) & ~0x3);
+}
+
+static inline u16 kernel_ds_by_msr(u64 msr_star)
+{
+	return ((msr_star >> 32) & ~0x3) + 8;
+}
+
+static inline u16 user_cs_by_msr(u64 msr_star)
+{
+	return ((msr_star >> 48) | 0x3) + 16;
+}
+
+/*
+ * The switcher does a real SWAPGS on entry, so while the guest state is loaded
+ * the guest's GS base is in the hardware MSR_KERNEL_GS_BASE.
+ */
+static inline void __save_gs_base(struct vcpu_pvm *pvm)
+{
+	rdmsrq(MSR_KERNEL_GS_BASE, pvm->segments[VCPU_SREG_GS].base);
+}
+
+static inline void __load_gs_base(struct vcpu_pvm *pvm)
+{
+	wrmsrq(MSR_KERNEL_GS_BASE, pvm->segments[VCPU_SREG_GS].base);
+}
+
+static inline void __save_fs_base(struct vcpu_pvm *pvm)
+{
+	rdmsrq(MSR_FS_BASE, pvm->segments[VCPU_SREG_FS].base);
+}
+
+static inline void __load_fs_base(struct vcpu_pvm *pvm)
+{
+	wrmsrq(MSR_FS_BASE, pvm->segments[VCPU_SREG_FS].base);
+}
+
+static void __set_cpuid_faulting(bool on)
+{
+	u64 msrval;
+
+	rdmsrq_safe(MSR_MISC_FEATURES_ENABLES, &msrval);
+	msrval &= ~MSR_MISC_FEATURES_ENABLES_CPUID_FAULT;
+	msrval |= (on << MSR_MISC_FEATURES_ENABLES_CPUID_FAULT_BIT);
+	wrmsrq(MSR_MISC_FEATURES_ENABLES, msrval);
+}
+
+static void reset_cpuid_intercept(struct kvm_vcpu *vcpu)
+{
+	if (test_thread_flag(TIF_NOCPUID))
+		return;
+
+	if (enable_cpuid_intercept || cpuid_fault_enabled(vcpu))
+		__set_cpuid_faulting(false);
+}
+
+static void set_cpuid_intercept(struct kvm_vcpu *vcpu)
+{
+	if (test_thread_flag(TIF_NOCPUID))
+		return;
+
+	if (enable_cpuid_intercept || cpuid_fault_enabled(vcpu))
+		__set_cpuid_faulting(true);
+}
+
+/*
+ * Non-PVM mode is everything before the guest reaches 64-bit PVM mode: the
+ * firmware or boot stub of the boot vCPU and the startup code of the others.
+ * It is not part of the PVM ABI and is only emulated, until the guest's
+ * state allows converting it to PVM mode.
+ */
+#define CONVERT_TO_PVM_CR0_OFF	(X86_CR0_NW | X86_CR0_CD)
+#define CONVERT_TO_PVM_CR0_ON	(X86_CR0_NE | X86_CR0_AM | X86_CR0_WP | \
+				 X86_CR0_PG | X86_CR0_PE)
+
+static inline void pvm_standard_msr_star(struct vcpu_pvm *pvm)
+{
+	pvm->msr_star = ((u64)pvm->segments[VCPU_SREG_CS].selector << 32) |
+			((u64)__USER32_CS << 48);
+}
+
+static bool try_to_convert_to_pvm_mode(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	unsigned long cr0 = vcpu->arch.cr0;
+
+	if (!is_long_mode(vcpu))
+		return false;
+	if (!pvm->segments[VCPU_SREG_CS].l) {
+		if (is_smod(pvm))
+			return false;
+		if (!pvm->segments[VCPU_SREG_CS].db)
+			return false;
+	}
+
+	/* Atomically set EFER_SCE converting to PVM mode. */
+	if ((vcpu->arch.efer | EFER_SCE) != vcpu->arch.efer)
+		vcpu->arch.efer |= EFER_SCE;
+
+	/* Change CR0 on converting to PVM mode. */
+	cr0 &= ~CONVERT_TO_PVM_CR0_OFF;
+	cr0 |= CONVERT_TO_PVM_CR0_ON;
+	if (cr0 != vcpu->arch.cr0)
+		kvm_set_cr0(vcpu, cr0);
+
+	/*
+	 * Atomically set MSR_STAR when switching to PVM mode if the guest is
+	 * in supervisor mode. In the case of user mode, the MSR_STAR should be
+	 * set using MSR setting during the VM migration.
+	 */
+	if (is_smod(pvm))
+		pvm_standard_msr_star(pvm);
+
+	pvm->non_pvm_mode = false;
+	pvm->int_shadow = 0;
+	pvm->nmi_mask = 0;
+
+	return true;
+}
+
+/*
+ * Test whether DS, ES, FS and GS need to be reloaded.
+ *
+ * Reading them only returns the selectors, but writing them (if
+ * nonzero) loads the full descriptor from the GDT or LDT.
+ *
+ * We therefore need to write new values to the segment registers
+ * on every host-guest state switch unless both the new and old
+ * values are zero.
+ */
+static inline bool need_reload_sel(u16 sel1, u16 sel2)
+{
+	return unlikely(sel1 | sel2);
+}
+
+/*
+ * Save host DS/ES/FS/GS selector, FS base, and inactive GS base.
+ * And load guest DS/ES/FS/GS selector, FS base, and GS base.
+ *
+ * Note, when the guest state is loaded and it is in hypervisor, the guest
+ * GS base is loaded in the hardware MSR_KERNEL_GS_BASE which is loaded
+ * with host inactive GS base when the guest state is NOT loaded.
+ */
+static void segments_save_host_and_switch_to_guest(struct vcpu_pvm *pvm)
+{
+	u16 pvm_ds_sel, pvm_es_sel, pvm_fs_sel, pvm_gs_sel;
+
+	/* Save host segments */
+	savesegment(ds, pvm->host_ds_sel);
+	savesegment(es, pvm->host_es_sel);
+	current_save_fsgs();
+
+	/* Load guest segments */
+	pvm_ds_sel = pvm->segments[VCPU_SREG_DS].selector;
+	pvm_es_sel = pvm->segments[VCPU_SREG_ES].selector;
+	pvm_fs_sel = pvm->segments[VCPU_SREG_FS].selector;
+	pvm_gs_sel = pvm->segments[VCPU_SREG_GS].selector;
+
+	if (need_reload_sel(pvm_ds_sel, pvm->host_ds_sel))
+		loadsegment(ds, pvm_ds_sel);
+	if (need_reload_sel(pvm_es_sel, pvm->host_es_sel))
+		loadsegment(es, pvm_es_sel);
+	if (need_reload_sel(pvm_fs_sel, current->thread.fsindex))
+		loadsegment(fs, pvm_fs_sel);
+	if (need_reload_sel(pvm_gs_sel, current->thread.gsindex))
+		load_gs_index(pvm_gs_sel);
+
+	__load_gs_base(pvm);
+	__load_fs_base(pvm);
+}
+
+/*
+ * Save guest DS/ES/FS/GS selector, FS base, and GS base.
+ * And load host DS/ES/FS/GS selector, FS base, and inactive GS base.
+ */
+static void segments_save_guest_and_switch_to_host(struct vcpu_pvm *pvm)
+{
+	u16 pvm_ds_sel, pvm_es_sel, pvm_fs_sel, pvm_gs_sel;
+
+	/* Save guest segments */
+	savesegment(ds, pvm_ds_sel);
+	savesegment(es, pvm_es_sel);
+	savesegment(fs, pvm_fs_sel);
+	savesegment(gs, pvm_gs_sel);
+	pvm->segments[VCPU_SREG_DS].selector = pvm_ds_sel;
+	pvm->segments[VCPU_SREG_ES].selector = pvm_es_sel;
+	pvm->segments[VCPU_SREG_FS].selector = pvm_fs_sel;
+	pvm->segments[VCPU_SREG_GS].selector = pvm_gs_sel;
+
+	__save_fs_base(pvm);
+	__save_gs_base(pvm);
+
+	/* Load host segments */
+	if (need_reload_sel(pvm_ds_sel, pvm->host_ds_sel))
+		loadsegment(ds, pvm->host_ds_sel);
+	if (need_reload_sel(pvm_es_sel, pvm->host_es_sel))
+		loadsegment(es, pvm->host_es_sel);
+	if (need_reload_sel(pvm_fs_sel, current->thread.fsindex))
+		loadsegment(fs, current->thread.fsindex);
+	if (need_reload_sel(pvm_gs_sel, current->thread.gsindex))
+		load_gs_index(current->thread.gsindex);
+
+	wrmsrq(MSR_KERNEL_GS_BASE, current->thread.gsbase);
+	wrmsrq(MSR_FS_BASE, current->thread.fsbase);
+}
+
+/*
+ * Load guest TLS entries into the GDT.
+ */
+static inline void host_gdt_set_tls(struct vcpu_pvm *pvm)
+{
+	struct desc_struct *gdt = get_current_gdt_rw();
+	unsigned int i;
+
+	for (i = 0; i < GDT_ENTRY_TLS_ENTRIES; i++)
+		gdt[GDT_ENTRY_TLS_MIN + i] = pvm->tls_array[i];
+}
+
+static void pvm_prepare_switch_to_guest(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	if (pvm->loaded_cpu_state)
+		return;
+
+	/* Non-PVM mode is emulated and has no hardware state to load. */
+	if (unlikely(pvm->non_pvm_mode))
+		return;
+
+	pvm->loaded_cpu_state = 1;
+
+#ifdef CONFIG_X86_IOPL_IOPERM
+	/*
+	 * PVM doesn't load guest I/O bitmap into hardware.  Invalidate I/O
+	 * bitmap if the current task is using it.  This prevents any possible
+	 * leakage of an active I/O bitmap to the guest and forces I/O
+	 * instructions in guest to be trapped and emulated.
+	 *
+	 * The I/O bitmap will be restored when the current task exits to
+	 * user mode in arch_exit_to_user_mode_prepare().
+	 */
+	if (test_thread_flag(TIF_IO_BITMAP))
+		native_tss_invalidate_io_bitmap();
+#endif
+
+	host_gdt_set_tls(pvm);
+
+#ifdef CONFIG_MODIFY_LDT_SYSCALL
+	/* PVM doesn't support LDT. */
+	if (unlikely(current->mm->context.ldt))
+		clear_LDT();
+#endif
+
+	segments_save_host_and_switch_to_guest(pvm);
+
+	set_cpuid_intercept(vcpu);
+
+	kvm_set_user_return_msr(0, (u64)entry_SYSCALL_64_switcher, -1ull);
+	kvm_set_user_return_msr(1, pvm->msr_tsc_aux, -1ull);
+	if (ia32_enabled()) {
+		if (is_intel)
+			kvm_set_user_return_msr(2, GDT_ENTRY_INVALID_SEG, -1ull);
+		else
+			kvm_set_user_return_msr(2, (u64)entry_SYSCALL32_ignore, -1ull);
+	}
+}
+
+static void pvm_prepare_switch_to_host(struct vcpu_pvm *pvm)
+{
+	if (!pvm->loaded_cpu_state)
+		return;
+
+	++pvm->vcpu.stat.host_state_reload;
+
+	reset_cpuid_intercept(&pvm->vcpu);
+
+#ifdef CONFIG_MODIFY_LDT_SYSCALL
+	if (unlikely(current->mm->context.ldt)) {
+		unsigned short sel = GDT_ENTRY_LDT * 8;
+
+		pvm_load_ldt(sel);
+	}
+#endif
+
+	/* Put the current task's TLS back into the GDT. */
+	native_load_tls(&current->thread, smp_processor_id());
+
+	segments_save_guest_and_switch_to_host(pvm);
+	pvm->loaded_cpu_state = 0;
+}
+
+/*
+ * Set all hardware states back to host.
+ * Except user return MSRs.
+ */
+static void pvm_switch_to_host(struct vcpu_pvm *pvm)
+{
+	preempt_disable();
+	pvm_prepare_switch_to_host(pvm);
+	preempt_enable();
+}
+
 struct pvm_asid_data {
 	u64 asid_generation;
 	u32 max_asid;
@@ -47,6 +381,232 @@ struct pvm_asid_data {
 };
 
 static DEFINE_PER_CPU(struct pvm_asid_data, pvm_asid);
+
+static void pvm_cache_reg(struct kvm_vcpu *vcpu, enum kvm_reg reg)
+{
+	/* Nothing to do */
+}
+
+static int pvm_set_efer(struct kvm_vcpu *vcpu, u64 efer)
+{
+	vcpu->arch.efer = efer;
+
+	return 0;
+}
+
+static bool pvm_is_valid_cr0(struct kvm_vcpu *vcpu, unsigned long cr4)
+{
+	return true;
+}
+
+static void pvm_set_cr0(struct kvm_vcpu *vcpu, unsigned long cr0)
+{
+	if (vcpu->arch.efer & EFER_LME) {
+		if (!is_paging(vcpu) && (cr0 & X86_CR0_PG))
+			vcpu->arch.efer |= EFER_LMA;
+
+		if (is_paging(vcpu) && !(cr0 & X86_CR0_PG))
+			vcpu->arch.efer &= ~EFER_LMA;
+	}
+
+	vcpu->arch.cr0 = cr0;
+}
+
+static bool pvm_is_valid_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
+{
+	return true;
+}
+
+static void pvm_set_cr4(struct kvm_vcpu *vcpu, unsigned long cr4)
+{
+	unsigned long old_cr4 = vcpu->arch.cr4;
+
+	vcpu->arch.cr4 = cr4;
+
+	if ((cr4 ^ old_cr4) & (X86_CR4_OSXSAVE | X86_CR4_PKE))
+		vcpu->arch.cpuid_dynamic_bits_dirty = true;
+}
+
+static void pvm_get_segment(struct kvm_vcpu *vcpu,
+			    struct kvm_segment *var, int seg)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	if (pvm->non_pvm_mode) {
+		*var = pvm->segments[seg];
+		return;
+	}
+
+	/* Update CS or SS to reflect the current mode. */
+	if (seg == VCPU_SREG_CS) {
+		if (is_smod(pvm)) {
+			pvm->segments[seg].selector = kernel_cs_by_msr(pvm->msr_star);
+			pvm->segments[seg].dpl = 0;
+			pvm->segments[seg].l = 1;
+			pvm->segments[seg].db = 0;
+		} else {
+			/*
+			 * The underlying selector itself, as the spec says
+			 * user mode CS is, and as every other vendor puts in
+			 * kvm_segment::selector.  It already carries RPL 3.
+			 */
+			pvm->segments[seg].selector = pvm->hw_cs;
+			pvm->segments[seg].dpl = 3;
+			if (pvm->hw_cs == __USER_CS) {
+				pvm->segments[seg].l = 1;
+				pvm->segments[seg].db = 0;
+			} else {
+				/* __USER32_CS */
+				pvm->segments[seg].l = 0;
+				pvm->segments[seg].db = 1;
+			}
+		}
+	} else if (seg == VCPU_SREG_SS) {
+		if (is_smod(pvm)) {
+			pvm->segments[seg].dpl = 0;
+			pvm->segments[seg].selector = kernel_ds_by_msr(pvm->msr_star);
+		} else {
+			pvm->segments[seg].dpl = 3;
+			pvm->segments[seg].selector = pvm->hw_ss;
+		}
+	}
+
+	/* Update DS/ES/FS/GS from the hardware when the guest state is loaded. */
+	pvm_switch_to_host(pvm);
+	*var = pvm->segments[seg];
+}
+
+static u64 pvm_get_segment_base(struct kvm_vcpu *vcpu, int seg)
+{
+	struct kvm_segment var;
+
+	pvm_get_segment(vcpu, &var, seg);
+	return var.base;
+}
+
+static int pvm_get_cpl(struct kvm_vcpu *vcpu)
+{
+	if (is_smod(to_pvm(vcpu)))
+		return 0;
+	return 3;
+}
+
+static void pvm_set_segment(struct kvm_vcpu *vcpu, struct kvm_segment *var, int seg)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	int cpl = pvm_get_cpl(vcpu);
+
+	/*
+	 * Unload DS/ES/FS/GS from the hardware before changing them, which
+	 * also covers leaving PVM mode.
+	 */
+	pvm_switch_to_host(pvm);
+	pvm->segments[seg] = *var;
+
+	switch (seg) {
+	case VCPU_SREG_CS:
+		if (var->dpl == 1 || var->dpl == 2)
+			goto invalid_change;
+		if (kvm_can_set_cpuid_and_feature_msrs(vcpu)) {
+			/*
+			 * The CPL may only change while the vCPU is being set up,
+			 * i.e. restored by a migration.
+			 */
+			if (cpl != var->dpl)
+				pvm_switch_flags_toggle_mod(pvm);
+		} else {
+			if (cpl != var->dpl)
+				goto invalid_change;
+			if (cpl == 0 && !var->l)
+				pvm->non_pvm_mode = true;
+			if (cpl == 0 && !pvm->non_pvm_mode)
+				pvm_standard_msr_star(pvm);
+		}
+		if (pvm->non_pvm_mode)
+			try_to_convert_to_pvm_mode(vcpu);
+		/*
+		 * In user mode the guest's CS is the underlying selector, so
+		 * this is where a restore puts it back.  In supervisor mode it
+		 * is emulated from MSR_STAR and the underlying CS must stay
+		 * __USER_CS -- pvm_vcpu_run() triple faults a vCPU that comes
+		 * back from the guest in supervisor mode with anything else --
+		 * so nothing is written there.  var->dpl rather than cpl,
+		 * because the mode may have just been toggled above.
+		 */
+		if (!pvm->non_pvm_mode && var->dpl == 3)
+			pvm->hw_cs = var->selector | USER_RPL;
+		break;
+	case VCPU_SREG_SS:
+		/* The other half of the same thing. */
+		if (!pvm->non_pvm_mode && var->dpl == 3)
+			pvm->hw_ss = var->selector | USER_RPL;
+		break;
+	case VCPU_SREG_LDTR:
+		/* PVM does not support an LDT. */
+		if (var->selector)
+			goto invalid_change;
+		break;
+	default:
+		break;
+	}
+
+	return;
+
+invalid_change:
+	kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
+}
+
+static void pvm_get_cs_db_l_bits(struct kvm_vcpu *vcpu, int *db, int *l)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	if (pvm->non_pvm_mode) {
+		*db = pvm->segments[VCPU_SREG_CS].db;
+		*l = pvm->segments[VCPU_SREG_CS].l;
+	} else {
+		if (pvm->hw_cs == __USER_CS) {
+			*db = 0;
+			*l = 1;
+		} else {
+			*db = 1;
+			*l = 0;
+		}
+	}
+}
+
+static void pvm_get_idt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
+{
+	*dt = to_pvm(vcpu)->idt_ptr;
+}
+
+static void pvm_set_idt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
+{
+	to_pvm(vcpu)->idt_ptr = *dt;
+}
+
+static void pvm_get_gdt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
+{
+	*dt = to_pvm(vcpu)->gdt_ptr;
+}
+
+static void pvm_set_gdt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
+{
+	to_pvm(vcpu)->gdt_ptr = *dt;
+}
+
+static u32 pvm_get_interrupt_shadow(struct kvm_vcpu *vcpu)
+{
+	return to_pvm(vcpu)->int_shadow;
+}
+
+static void pvm_set_interrupt_shadow(struct kvm_vcpu *vcpu, int mask)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	/* PVM spec: ignore interrupt shadow when in PVM mode. */
+	if (pvm->non_pvm_mode)
+		pvm->int_shadow = mask;
+}
 
 static bool cpu_has_pvm_wbinvd_exit(void)
 {
@@ -414,6 +974,29 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.vm_init = pvm_vm_init,
 
 	.vcpu_create = pvm_vcpu_create,
+
+	.prepare_switch_to_guest = pvm_prepare_switch_to_guest,
+
+	.get_segment_base = pvm_get_segment_base,
+	.get_segment = pvm_get_segment,
+	.set_segment = pvm_set_segment,
+	.get_cpl = pvm_get_cpl,
+	/* Nothing cached: the mode is switch_flags, which is always current. */
+	.get_cpl_no_cache = pvm_get_cpl,
+	.get_cs_db_l_bits = pvm_get_cs_db_l_bits,
+	.is_valid_cr0 = pvm_is_valid_cr0,
+	.set_cr0 = pvm_set_cr0,
+	.is_valid_cr4 = pvm_is_valid_cr4,
+	.set_cr4 = pvm_set_cr4,
+	.set_efer = pvm_set_efer,
+	.get_gdt = pvm_get_gdt,
+	.set_gdt = pvm_set_gdt,
+	.get_idt = pvm_get_idt,
+	.set_idt = pvm_set_idt,
+	.cache_reg = pvm_cache_reg,
+
+	.set_interrupt_shadow = pvm_set_interrupt_shadow,
+	.get_interrupt_shadow = pvm_get_interrupt_shadow,
 
 #ifdef CONFIG_KVM_SMM
 	.smi_allowed = pvm_smi_allowed,
