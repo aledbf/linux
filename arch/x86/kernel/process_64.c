@@ -378,14 +378,14 @@ static __always_inline void x86_pkru_load(struct thread_struct *prev,
 		return;
 
 	/* Stash the prev task's value: */
-	prev->pkru = rdpkru();
+	prev->pkru = __read_pkru();
 
 	/*
 	 * PKRU writes are slightly expensive.  Avoid them when not
 	 * strictly necessary:
 	 */
 	if (prev->pkru != next->pkru)
-		wrpkru(next->pkru);
+		__write_pkru(next->pkru);
 }
 
 static __always_inline void x86_fsgsbase_load(struct thread_struct *prev,

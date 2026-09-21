@@ -59,4 +59,19 @@ static inline void pkru_write_default(void)
 	wrpkru(pkru_get_init_value());
 }
 
+/*
+ * The current task's PKRU, for a caller that has checked X86_FEATURE_OSPKE
+ * itself.  __write_pkru() loads it without comparing it against the current
+ * value, for a caller that has just read that value.
+ */
+static inline u32 __read_pkru(void)
+{
+	return rdpkru();
+}
+
+static inline void __write_pkru(u32 pkru)
+{
+	wrpkru(pkru);
+}
+
 #endif
