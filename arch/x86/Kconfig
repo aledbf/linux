@@ -847,6 +847,25 @@ config KVM_GUEST
 	  underlying device model, the host provides the guest with
 	  timing infrastructure such as time of day, and system time
 
+config PVM_GUEST
+	bool "PVM Guest support"
+	depends on X86_64 && KVM_GUEST && !KASAN && !KMSAN && !RUST
+	select PARAVIRT_XXL
+	select X86_PIE
+	select RELOCATABLE_UNCOMPRESSED_KERNEL
+	help
+	  This option enables the kernel to run as a PVM guest under the PVM
+	  hypervisor, which uses shadow paging and hardware CPL3 instead of
+	  VMX/SVM.  The kernel is relocated out of the top 2GB, so it has to
+	  be built as a PIE image, which Rust code does not support.  KASAN
+	  keeps its shadow memory at a fixed address in the upper half, and
+	  KMSAN lays out its metadata for the native vmalloc area, so neither
+	  can be used in a PVM guest.
+
+	  The PIE build applies to the whole kernel, which is then larger and
+	  somewhat slower also on bare metal and as an ordinary guest.  Say N
+	  unless the kernel is meant to run as a PVM guest.
+
 config ARCH_CPUIDLE_HALTPOLL
 	def_bool n
 	prompt "Disable host haltpoll when loading haltpoll driver"

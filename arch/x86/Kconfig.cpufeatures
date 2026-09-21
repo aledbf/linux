@@ -186,10 +186,14 @@ config X86_DISABLED_FEATURE_TDX_GUEST
 	def_bool y
 	depends on !INTEL_TDX_GUEST
 
-# Set by Xen PV guests, which must return to user mode via IRET.
+config X86_DISABLED_FEATURE_KVM_PVM_GUEST
+	def_bool y
+	depends on !PVM_GUEST
+
+# Set by Xen PV and PVM guests, which must return to user mode via IRET.
 config X86_DISABLED_FEATURE_PV_GUEST
 	def_bool y
-	depends on !XEN_PV
+	depends on !XEN_PV && !PVM_GUEST
 
 config X86_DISABLED_FEATURE_USER_SHSTK
 	def_bool y

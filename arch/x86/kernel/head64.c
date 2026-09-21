@@ -258,7 +258,11 @@ asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode
 	/* Kill off the identity-map trampoline */
 	reset_early_page_tables();
 
-	if (pgtable_l5_enabled()) {
+	/*
+	 * Unless pvm_relocate_kernel() has already placed the direct mapping
+	 * inside the PVM guest's half of the address space.
+	 */
+	if (pgtable_l5_enabled() && page_offset_base == __PAGE_OFFSET_BASE_L4) {
 		page_offset_base	= __PAGE_OFFSET_BASE_L5;
 		vmalloc_base		= __VMALLOC_BASE_L5;
 		vmemmap_base		= __VMEMMAP_BASE_L5;

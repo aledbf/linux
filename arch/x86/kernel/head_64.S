@@ -71,6 +71,18 @@ SYM_CODE_START_NOALIGN(startup_64)
 	xorl	%edx, %edx
 	wrmsr
 
+#ifdef CONFIG_PVM_GUEST
+	/*
+	 * Relocate the image into the guest's half of the address space
+	 * before anything uses a kernel virtual address.  A no-op when not
+	 * running under PVM.  After the PVH entry point has already relocated
+	 * the image, this finds nothing to move and re-aliases the same PVH
+	 * page table entries.
+	 */
+	leaq	_text(%rip), %rdi
+	call	pvm_relocate_kernel
+#endif
+
 	call	__pi_startup_64_setup_gdt_idt
 
 	/* Now switch to __KERNEL_CS so IRET works reliably */
@@ -142,6 +154,14 @@ SYM_CODE_END(startup_64)
 
 	__INITRODATA
 SYM_DATA_LOCAL(.Lcommon_startup_64, .quad common_startup_64)
+
+#ifdef CONFIG_PVM_GUEST
+/*
+ * The current virtual address of _text for pvm_relocate_kernel(), which
+ * cannot form absolute references itself.
+ */
+SYM_DATA(pvm_text_va, .quad _text)
+#endif
 
 	.text
 SYM_CODE_START(secondary_startup_64)

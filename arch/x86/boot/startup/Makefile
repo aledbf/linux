@@ -50,3 +50,13 @@ $(obj)/%.pi.o: $(obj)/%.o FORCE
 
 targets	+= $(obj-y)
 obj-y	:= $(patsubst %.o,%.pi.o,$(obj-y))
+
+#
+# The early relocation of a PVM guest kernel runs before the relocation table
+# has been applied, and is built and checked like the code above.  It is linked
+# without the __pi_ prefix: head_64.S and the PVH entry point call
+# pvm_relocate_kernel(), and the rest of the kernel reads the variables it sets.
+#
+obj-$(CONFIG_PVM_GUEST)		+= pvm_startup.o
+$(obj)/pvm_startup.o: objtool-enabled	= 1
+$(obj)/pvm_startup.o: objtool-args	= $(if $(delay-objtool),--dry-run,$(objtool-args-y)) --noabs

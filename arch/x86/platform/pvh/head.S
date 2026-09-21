@@ -184,6 +184,17 @@ SYM_CODE_START(pvh_start_xen)
 	xorl %edx, %edx
 	wrmsr
 
+#ifdef CONFIG_PVM_GUEST
+	/*
+	 * Move the image into the guest's half of the address space.  This
+	 * has to precede xen_prepare_pvh(), which calls through pv_ops
+	 * pointers that the relocation updates.  A no-op when not running
+	 * under PVM.
+	 */
+	leaq	_text(%rip), %rdi
+	call	pvm_relocate_kernel
+#endif
+
 #ifdef CONFIG_X86_PIE
 	/*
 	 * A PIE kernel has no absolute references in its code, so it can run

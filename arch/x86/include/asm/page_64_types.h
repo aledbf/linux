@@ -6,6 +6,11 @@
 #include <asm/kaslr.h>
 
 extern unsigned long kernel_map_base;
+
+#ifdef CONFIG_PVM_GUEST
+/* The top of a PVM guest's user space, see arch/x86/boot/startup/pvm_startup.c. */
+extern unsigned long pvm_task_size_max;
+#endif
 #endif
 
 #ifdef CONFIG_KASAN
