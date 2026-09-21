@@ -419,6 +419,19 @@ static int lapic_next_event(unsigned long delta, struct clock_event_device *evt)
 	return 0;
 }
 
+/*
+ * A PVM guest runs at CPL3, where WRMSR traps to the host; use the paravirt
+ * MSR path, which is a hypercall.  On kernels without CONFIG_PVM_GUEST this
+ * is the bare instruction.
+ */
+static __always_inline void write_tsc_deadline(u64 deadline)
+{
+	if (cpu_feature_enabled(X86_FEATURE_KVM_PVM_GUEST))
+		wrmsrq(MSR_IA32_TSC_DEADLINE, deadline);
+	else
+		native_wrmsrq(MSR_IA32_TSC_DEADLINE, deadline);
+}
+
 static int lapic_next_deadline(unsigned long delta, struct clock_event_device *evt)
 {
 	/*
@@ -427,7 +440,7 @@ static int lapic_next_deadline(unsigned long delta, struct clock_event_device *e
 	 */
 	u64 tsc = rdtsc();
 
-	native_wrmsrq(MSR_IA32_TSC_DEADLINE, tsc + (((u64) delta) * TSC_DIVISOR));
+	write_tsc_deadline(tsc + (((u64) delta) * TSC_DIVISOR));
 	return 0;
 }
 
@@ -451,7 +464,7 @@ static int lapic_timer_shutdown(struct clock_event_device *evt)
 	 * the timer _and_ zero the counter registers:
 	 */
 	if (v & APIC_LVT_TIMER_TSCDEADLINE)
-		native_wrmsrq(MSR_IA32_TSC_DEADLINE, 0);
+		write_tsc_deadline(0);
 	else
 		apic_write(APIC_TMICT, 0);
 
