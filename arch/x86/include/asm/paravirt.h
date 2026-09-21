@@ -106,7 +106,7 @@ static inline void write_cr0(unsigned long x)
 static __always_inline unsigned long read_cr2(void)
 {
 	return PVOP_ALT_CALLEE0(unsigned long, pv_ops, mmu.read_cr2,
-				"mov %%cr2, %%rax", ALT_NOT_XEN);
+				"mov %%cr2, %%rax", ALT_NOT_PV);
 }
 
 static __always_inline void write_cr2(unsigned long x)
@@ -117,12 +117,12 @@ static __always_inline void write_cr2(unsigned long x)
 static inline unsigned long __read_cr3(void)
 {
 	return PVOP_ALT_CALL0(unsigned long, pv_ops, mmu.read_cr3,
-			      "mov %%cr3, %%rax", ALT_NOT_XEN);
+			      "mov %%cr3, %%rax", ALT_NOT_PV);
 }
 
 static inline void write_cr3(unsigned long x)
 {
-	PVOP_ALT_VCALL1(pv_ops, mmu.write_cr3, x, "mov %%rdi, %%cr3", ALT_NOT_XEN);
+	PVOP_ALT_VCALL1(pv_ops, mmu.write_cr3, x, "mov %%rdi, %%cr3", ALT_NOT_PV);
 }
 
 static inline void __write_cr4(unsigned long x)
@@ -324,25 +324,25 @@ static inline void paravirt_release_p4d(unsigned long pfn)
 static inline pte_t __pte(pteval_t val)
 {
 	return (pte_t) { PVOP_ALT_CALLEE1(pteval_t, pv_ops, mmu.make_pte, val,
-					  "mov %%rdi, %%rax", ALT_NOT_XEN) };
+					  "mov %%rdi, %%rax", ALT_NOT_PV) };
 }
 
 static inline pteval_t pte_val(pte_t pte)
 {
 	return PVOP_ALT_CALLEE1(pteval_t, pv_ops, mmu.pte_val, pte.pte,
-				"mov %%rdi, %%rax", ALT_NOT_XEN);
+				"mov %%rdi, %%rax", ALT_NOT_PV);
 }
 
 static inline pgd_t __pgd(pgdval_t val)
 {
 	return (pgd_t) { PVOP_ALT_CALLEE1(pgdval_t, pv_ops, mmu.make_pgd, val,
-					  "mov %%rdi, %%rax", ALT_NOT_XEN) };
+					  "mov %%rdi, %%rax", ALT_NOT_PV) };
 }
 
 static inline pgdval_t pgd_val(pgd_t pgd)
 {
 	return PVOP_ALT_CALLEE1(pgdval_t, pv_ops, mmu.pgd_val, pgd.pgd,
-				"mov %%rdi, %%rax", ALT_NOT_XEN);
+				"mov %%rdi, %%rax", ALT_NOT_PV);
 }
 
 #define  __HAVE_ARCH_PTEP_MODIFY_PROT_TRANSACTION
@@ -376,13 +376,13 @@ static inline void set_pmd(pmd_t *pmdp, pmd_t pmd)
 static inline pmd_t __pmd(pmdval_t val)
 {
 	return (pmd_t) { PVOP_ALT_CALLEE1(pmdval_t, pv_ops, mmu.make_pmd, val,
-					  "mov %%rdi, %%rax", ALT_NOT_XEN) };
+					  "mov %%rdi, %%rax", ALT_NOT_PV) };
 }
 
 static inline pmdval_t pmd_val(pmd_t pmd)
 {
 	return PVOP_ALT_CALLEE1(pmdval_t, pv_ops, mmu.pmd_val, pmd.pmd,
-				"mov %%rdi, %%rax", ALT_NOT_XEN);
+				"mov %%rdi, %%rax", ALT_NOT_PV);
 }
 
 static inline void set_pud(pud_t *pudp, pud_t pud)
@@ -395,7 +395,7 @@ static inline pud_t __pud(pudval_t val)
 	pudval_t ret;
 
 	ret = PVOP_ALT_CALLEE1(pudval_t, pv_ops, mmu.make_pud, val,
-			       "mov %%rdi, %%rax", ALT_NOT_XEN);
+			       "mov %%rdi, %%rax", ALT_NOT_PV);
 
 	return (pud_t) { ret };
 }
@@ -403,7 +403,7 @@ static inline pud_t __pud(pudval_t val)
 static inline pudval_t pud_val(pud_t pud)
 {
 	return PVOP_ALT_CALLEE1(pudval_t, pv_ops, mmu.pud_val, pud.pud,
-				"mov %%rdi, %%rax", ALT_NOT_XEN);
+				"mov %%rdi, %%rax", ALT_NOT_PV);
 }
 
 static inline void pud_clear(pud_t *pudp)
@@ -421,7 +421,7 @@ static inline void set_p4d(p4d_t *p4dp, p4d_t p4d)
 static inline p4d_t __p4d(p4dval_t val)
 {
 	p4dval_t ret = PVOP_ALT_CALLEE1(p4dval_t, pv_ops, mmu.make_p4d, val,
-					"mov %%rdi, %%rax", ALT_NOT_XEN);
+					"mov %%rdi, %%rax", ALT_NOT_PV);
 
 	return (p4d_t) { ret };
 }
@@ -429,7 +429,7 @@ static inline p4d_t __p4d(p4dval_t val)
 static inline p4dval_t p4d_val(p4d_t p4d)
 {
 	return PVOP_ALT_CALLEE1(p4dval_t, pv_ops, mmu.p4d_val, p4d.p4d,
-				"mov %%rdi, %%rax", ALT_NOT_XEN);
+				"mov %%rdi, %%rax", ALT_NOT_PV);
 }
 
 static inline void __set_pgd(pgd_t *pgdp, pgd_t pgd)
@@ -504,17 +504,17 @@ static inline void __set_fixmap(unsigned /* enum fixed_addresses */ idx,
 static __always_inline unsigned long arch_local_save_flags(void)
 {
 	return PVOP_ALT_CALLEE0(unsigned long, pv_ops, irq.save_fl, "pushf; pop %%rax",
-				ALT_NOT_XEN);
+				ALT_NOT_PV);
 }
 
 static __always_inline void arch_local_irq_disable(void)
 {
-	PVOP_ALT_VCALLEE0(pv_ops, irq.irq_disable, "cli", ALT_NOT_XEN);
+	PVOP_ALT_VCALLEE0(pv_ops, irq.irq_disable, "cli", ALT_NOT_PV);
 }
 
 static __always_inline void arch_local_irq_enable(void)
 {
-	PVOP_ALT_VCALLEE0(pv_ops, irq.irq_enable, "sti", ALT_NOT_XEN);
+	PVOP_ALT_VCALLEE0(pv_ops, irq.irq_enable, "sti", ALT_NOT_PV);
 }
 
 static __always_inline unsigned long arch_local_irq_save(void)
@@ -542,7 +542,7 @@ static __always_inline unsigned long arch_local_irq_save(void)
 
 #define SAVE_FLAGS ALTERNATIVE_2 "PARA_IRQ_save_fl",			\
 				 "ALT_CALL_INSTR", ALT_CALL_ALWAYS,	\
-				 "pushf; pop %rax", ALT_NOT_XEN
+				 "pushf; pop %rax", ALT_NOT_PV
 #endif
 #endif /* CONFIG_PARAVIRT_XXL */
 #endif	/* CONFIG_X86_64 */

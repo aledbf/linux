@@ -191,7 +191,7 @@ static noinstr unsigned long __rdgsbase_inactive(void)
 	 * operating system never changes its runtime GS base address.
 	 */
 	if (!cpu_feature_enabled(X86_FEATURE_FRED) &&
-	    !cpu_feature_enabled(X86_FEATURE_XENPV)) {
+	    !cpu_feature_enabled(X86_FEATURE_PV_GUEST)) {
 		native_swapgs();
 		gsbase = rdgsbase();
 		native_swapgs();
@@ -217,7 +217,7 @@ static noinstr void __wrgsbase_inactive(unsigned long gsbase)
 	lockdep_assert_irqs_disabled();
 
 	if (!cpu_feature_enabled(X86_FEATURE_FRED) &&
-	    !cpu_feature_enabled(X86_FEATURE_XENPV)) {
+	    !cpu_feature_enabled(X86_FEATURE_PV_GUEST)) {
 		native_swapgs();
 		wrgsbase(gsbase);
 		native_swapgs();

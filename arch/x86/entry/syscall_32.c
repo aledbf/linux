@@ -322,8 +322,8 @@ __visible noinstr bool do_fast_syscall_32(struct pt_regs *regs)
 	 * IRET exit path.
 	 */
 
-	/* XEN PV guests always use the IRET path */
-	if (cpu_feature_enabled(X86_FEATURE_XENPV))
+	/* Paravirtualized guests always use the IRET path */
+	if (cpu_feature_enabled(X86_FEATURE_PV_GUEST))
 		return false;
 
 	/* EIP must point to the VDSO landing pad */

@@ -218,9 +218,9 @@ SYM_INNER_LABEL(entry_SYSCALL_compat_after_hwframe, SYM_L_GLOBAL)
 	call	do_fast_syscall_32
 
 sysret32_from_system_call:
-	/* XEN PV guests always use IRET path */
+	/* Paravirtualized guests always use IRET path */
 	ALTERNATIVE "testb %al, %al; jz swapgs_restore_regs_and_return_to_usermode", \
-		    "jmp swapgs_restore_regs_and_return_to_usermode", X86_FEATURE_XENPV
+		    "jmp swapgs_restore_regs_and_return_to_usermode", X86_FEATURE_PV_GUEST
 
 	/*
 	 * Opportunistic SYSRET

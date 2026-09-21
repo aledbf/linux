@@ -454,7 +454,13 @@ extern struct paravirt_patch_template pv_ops;
 
 #endif	/* __ASSEMBLER__ */
 
-#define ALT_NOT_XEN	ALT_NOT(X86_FEATURE_XENPV)
+/*
+ * A guest kernel that does not run at CPL0 has to take the pv_ops path rather
+ * than the privileged instruction.  X86_FEATURE_PV_GUEST is set by every such
+ * guest, Xen PV being one; kvmclock and the other paravirtual interfaces of a
+ * guest that runs at CPL0 do not set it.
+ */
+#define ALT_NOT_PV	ALT_NOT(X86_FEATURE_PV_GUEST)
 
 #ifdef CONFIG_X86_32
 /* save and restore all caller-save registers, except return value */

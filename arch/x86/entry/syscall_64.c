@@ -94,8 +94,8 @@ __visible noinstr bool do_syscall_64(struct pt_regs *regs, long nr)
 	 * exit path.
 	 */
 
-	/* XEN PV guests always use the IRET path */
-	if (cpu_feature_enabled(X86_FEATURE_XENPV))
+	/* Paravirtualized guests always use the IRET path */
+	if (cpu_feature_enabled(X86_FEATURE_PV_GUEST))
 		return false;
 
 	/* SYSRET requires RCX == RIP and R11 == EFLAGS */
