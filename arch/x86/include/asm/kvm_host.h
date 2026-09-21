@@ -734,7 +734,42 @@ enum kvm_only_cpuid_leafs {
 	NKVMCAPINTS = NR_KVM_CPU_CAPS - NCAPINTS,
 };
 
+#ifdef CONFIG_KVM_PVM_STATS
+/*
+ * How long the shadow MMU's page fault path waits for mmu_lock and holds it.
+ * A measurement aid, not a feature.
+ */
+struct kvm_mmu_lock_stats {
+	u64 count;
+	u64 contended;		/* write_trylock() failed first */
+	u64 wait_ns;
+	u64 hold_ns;
+	u64 hold_start;
+};
+
+/*
+ * Shadow page faults the guest page table walk could not resolve, and so
+ * reflected to the guest, by why.  "np" is a not-present guest entry, split
+ * by the mode and access of the fault and by the guest paging level that was
+ * not present (index 0 is the 4K PTE).
+ */
+struct kvm_pf_reflect_stats {
+	u64 np, np_user, np_write, np_fetch;
+	u64 np_level[5];
+	u64 protection, reserved, pku;
+};
+#endif
+
 struct kvm_vcpu_arch {
+#ifdef CONFIG_KVM_PVM_STATS
+	struct kvm_mmu_lock_stats mmu_lock_stats;
+	struct kvm_pf_reflect_stats pf_reflect_stats;
+	/*
+	 * local_clock() at points of vcpu_enter_guest(), for kvm-pvm to split
+	 * the host time between an exit's handler and the next entry.
+	 */
+	u64 entry_stamp[11];
+#endif
 	/*
 	 * rip and regs accesses must go through
 	 * kvm_{register,rip}_{read,write} functions.

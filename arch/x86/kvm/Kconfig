@@ -187,6 +187,18 @@ config KVM_PVM
 	  To compile this as a module, choose M here: the module
 	  will be called kvm-pvm.
 
+config KVM_PVM_STATS
+	bool "Count PVM fast paths and the exits that fall back from them"
+	depends on KVM_PVM
+	help
+	  Counts, per vCPU, how often the switcher serves a guest ring switch
+	  or a page-table load by itself, how often it falls back to the
+	  hypervisor and why, and how the TLB invalidation hypercalls arrive.
+	  Printed with the vCPU's teardown as one "PVMSTATS:" line.
+
+	  For measuring the fast paths, not for running guests: it adds a
+	  memory increment to each of them.  If unsure, say N.
+
 config KVM_IOAPIC
 	bool "I/O APIC, PIC, and PIT emulation"
 	default y

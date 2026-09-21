@@ -50,6 +50,9 @@ static __always_inline void pvm_load_ldt(u16 sel)
 
 static void pvm_unpin_vcpu_struct(struct vcpu_pvm *pvm);
 static int pvm_pin_vcpu_struct(struct vcpu_pvm *pvm, gpa_t gpa);
+#ifdef CONFIG_KVM_PVM_STATS
+static void pvm_stats_mark(struct kvm *kvm, u64 mark);
+#endif
 
 static inline bool is_smod(struct vcpu_pvm *pvm)
 {
@@ -66,6 +69,40 @@ static inline void pvm_switch_flags_toggle_mod(struct vcpu_pvm *pvm)
 {
 	pvm->switch_flags ^= SWITCH_FLAGS_MOD_TOGGLE;
 }
+
+#ifdef CONFIG_KVM_PVM_STATS
+#define pvm_stat_add(pvm, name, n)	((pvm)->stats.name += (n))
+
+/*
+ * A guest ring switch the switcher could have served and sent here instead,
+ * attributed to the inhibitor that did it.  The flags are still the ones the
+ * switcher exited with: nothing between the exit and the handler changes them.
+ */
+static void pvm_stat_fallback(struct vcpu_pvm *pvm, bool eretu)
+{
+	unsigned long inhibitors = pvm->switch_flags & SWITCH_FLAGS_INHIBITORS;
+
+	if (eretu) {
+		pvm->stats.eretu_exit++;
+		if (inhibitors & SWITCH_FLAGS_NO_DS_CR3)
+			pvm->stats.eretu_exit_no_ds_cr3++;
+		else if (inhibitors)
+			pvm->stats.eretu_exit_other++;
+		else
+			pvm->stats.eretu_exit_sel++;
+	} else {
+		pvm->stats.syscall_umod_exit++;
+		if (inhibitors & SWITCH_FLAGS_NO_DS_CR3)
+			pvm->stats.syscall_umod_exit_no_ds_cr3++;
+		else if (inhibitors)
+			pvm->stats.syscall_umod_exit_other++;
+	}
+}
+#else
+#define pvm_stat_add(pvm, name, n)	do { } while (0)
+static inline void pvm_stat_fallback(struct vcpu_pvm *pvm, bool eretu) {}
+#endif
+#define pvm_stat_inc(pvm, name)		pvm_stat_add(pvm, name, 1)
 
 /*
  * The selectors MSR_STAR describes: kernel CS in bits 47:32 with RPL 0 and
@@ -737,6 +774,8 @@ static void pvm_publish_pgtbl_cache(struct vcpu_pvm *pvm)
 	unsigned int smod_roots = 0, umod_roots = 0;
 	int i, j, n = 0;
 
+	pvm_stat_inc(pvm, pgtbl_publish);
+
 	/* The roles the two roots of a pair have; see switch_to_smod(). */
 	kvm_mmu_role_set_user(&smod_role, false);
 	kvm_mmu_role_set_user(&umod_role, true);
@@ -785,6 +824,7 @@ static void pvm_publish_pgtbl_cache(struct vcpu_pvm *pvm)
 
 		if (!r->pgd)
 			continue;
+		pvm_stat_inc(pvm, pgtbl_roots_scanned);
 		if (is_root_usable(r, r->pgd, smod_role))
 			smod_roots |= BIT(i);
 		else if (is_root_usable(r, r->pgd, umod_role))
@@ -838,9 +878,11 @@ static void pvm_publish_pgtbl_cache(struct vcpu_pvm *pvm)
 			tbl[n].umod_cr3 = __sme_set(mmu->prev_roots[j].hpa) |
 					  (pcid ^ PVM_UMOD_PCID_MASK) |
 					  (hw_cr3 & CR3_NOFLUSH);
+			pvm_stat_inc(pvm, pgtbl_published_paired);
 		}
 		n++;
 	}
+	pvm_stat_add(pvm, pgtbl_published, n);
 
 out:
 	/* 0 is the empty marker: a guest CR3 of 0 has no PGD and cannot load. */
@@ -1280,6 +1322,11 @@ static int pvm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 			return 1;
 		pvm->msr_features_enabled = data;
 		break;
+#ifdef CONFIG_KVM_PVM_STATS
+	case MSR_PVM_STATS_MARK:
+		pvm_stats_mark(vcpu->kvm, data);
+		break;
+#endif
 	default:
 		ret = kvm_set_msr_common(vcpu, msr_info);
 	}
@@ -1946,6 +1993,8 @@ static int handle_synthetic_instruction_return_user(struct kvm_vcpu *vcpu)
 	unsigned long rflags;
 	u32 pending_async_exceptions;
 
+	pvm_stat_fallback(pvm, true);
+
 	/* switch to user mode before rsp changed. */
 	switch_to_umod(vcpu);
 
@@ -2018,6 +2067,11 @@ static int handle_hc_load_pagetables(struct kvm_vcpu *vcpu, unsigned long flags,
 	unsigned long old_cr4 = vcpu->arch.cr4;
 	unsigned long cr4 = old_cr4;
 
+	pvm_stat_inc(to_pvm(vcpu), hc_load_pgtbl);
+	if (flags != (kvm_is_cr4_bit_set(vcpu, X86_CR4_LA57) ?
+		      PVM_LOAD_PGTBL_FLAGS_LA57 : 0))
+		pvm_stat_inc(to_pvm(vcpu), hc_load_pgtbl_flags);
+
 	/*
 	 * Unlike MOV to CR4, the paging level may change here, together with
 	 * CR3.  LA57 is the only bit that changes, only where the guest's CPUID
@@ -2064,6 +2118,7 @@ static int handle_hc_load_pagetables(struct kvm_vcpu *vcpu, unsigned long flags,
  */
 static int handle_hc_flush_tlb_all(struct kvm_vcpu *vcpu)
 {
+	pvm_stat_inc(to_pvm(vcpu), hc_flush_all);
 	kvm_make_request(KVM_REQ_TLB_FLUSH_GUEST, vcpu);
 
 	return 1;
@@ -2075,6 +2130,7 @@ static int handle_hc_flush_tlb_all(struct kvm_vcpu *vcpu)
  */
 static int handle_hc_flush_tlb_current(struct kvm_vcpu *vcpu)
 {
+	pvm_stat_inc(to_pvm(vcpu), hc_flush_current);
 	kvm_set_cr3(vcpu, vcpu->arch.cr3);
 
 	return 1;
@@ -2086,6 +2142,16 @@ static int handle_hc_flush_tlb_current(struct kvm_vcpu *vcpu)
  */
 static int handle_hc_invlpg(struct kvm_vcpu *vcpu, unsigned long addr)
 {
+#ifdef CONFIG_KVM_PVM_STATS
+	struct pvm_stats *st = &to_pvm(vcpu)->stats;
+
+	st->hc_invlpg++;
+	if (addr == st->last_invlpg_addr + PAGE_SIZE &&
+	    st->entries == st->last_invlpg_entry + 1)
+		st->hc_invlpg_seq++;
+	st->last_invlpg_addr = addr;
+	st->last_invlpg_entry = st->entries;
+#endif
 	kvm_mmu_invlpg(vcpu, addr);
 
 	return 1;
@@ -2199,6 +2265,22 @@ static int handle_hc_rdmsr(struct kvm_vcpu *vcpu, u32 index)
 static int handle_hc_wrmsr(struct kvm_vcpu *vcpu, u32 index, u64 value)
 {
 	/* See handle_hc_rdmsr() for the accessor and the tracepoint. */
+	pvm_stat_inc(to_pvm(vcpu), hc_wrmsr);
+	switch (index) {
+	case APIC_BASE_MSR + (APIC_ICR >> 4):
+		pvm_stat_inc(to_pvm(vcpu), hc_wrmsr_icr);
+		break;
+	case MSR_IA32_TSC_DEADLINE:
+		pvm_stat_inc(to_pvm(vcpu), hc_wrmsr_tsc_deadline);
+		break;
+	case APIC_BASE_MSR + (APIC_EOI >> 4):
+		pvm_stat_inc(to_pvm(vcpu), hc_wrmsr_eoi);
+		break;
+	default:
+		pvm_stat_inc(to_pvm(vcpu), hc_wrmsr_other);
+		break;
+	}
+
 	if (kvm_emulate_msr_write(vcpu, index, value)) {
 		trace_kvm_msr_write_ex(index, value);
 		kvm_rax_write_raw(vcpu, -KVM_EINVAL);
@@ -2288,6 +2370,7 @@ static int handle_exit_syscall(struct kvm_vcpu *vcpu)
 	unsigned long a0, a1, a2;
 
 	if (!is_smod(pvm)) {
+		pvm_stat_fallback(pvm, false);
 		__do_pvm_event(vcpu, true, PVM_SYSCALL_VECTOR, false, 0);
 		return 1;
 	}
@@ -2496,8 +2579,13 @@ static bool pvm_direct_pf_candidate(struct vcpu_pvm *pvm, u32 hw_error_code,
 	if (vcpu->arch.exception.pending || vcpu->arch.exception.injected ||
 	    vcpu->arch.apf.host_apf_flags)
 		return false;
-	if (!pvm_direct_pf_rule(run, pvm->pf_direct_page, cr2))
+	if (!pvm_direct_pf_rule(run, pvm->pf_direct_page, cr2)) {
+		if (run && (cr2 & PAGE_MASK) == pvm->pf_direct_page)
+			pvm_stat_inc(pvm, dpf_refused_same_page);
+		else
+			pvm_stat_inc(pvm, dpf_refused_run);
 		return false;
+	}
 
 	pvm->pf_direct_run = run + 1;
 	pvm->pf_direct_page = cr2 & PAGE_MASK;
@@ -2521,6 +2609,10 @@ static int handle_exit_exception(struct kvm_vcpu *vcpu)
 	 * for emulation or debugging.
 	 */
 	case PF_VECTOR:
+		if (is_smod(pvm))
+			pvm_stat_inc(pvm, pf_exit_smod);
+		else
+			pvm_stat_inc(pvm, pf_exit_umod);
 		dpf = !is_smod(pvm) &&
 		      pvm_direct_pf_candidate(pvm, error_code, pvm->exit_cr2);
 		if (dpf) {
@@ -2541,6 +2633,10 @@ static int handle_exit_exception(struct kvm_vcpu *vcpu)
 
 			kvm_request_l1tf_flush_l1d();
 			__kvm_inject_emulated_page_fault(vcpu, &fault, true);
+			pvm_stat_inc(pvm, dpf_exit_delivered);
+#ifdef CONFIG_KVM_PVM_STATS
+			pvm->stats.last_exit_class = PVM_EXIT_CLASS_PF_DIRECT;
+#endif
 			return 1;
 		}
 		/*
@@ -2580,8 +2676,23 @@ static int handle_exit_exception(struct kvm_vcpu *vcpu)
 			error_code &= ~PFERR_PK_MASK;
 		}
 
-		return kvm_handle_page_fault(vcpu, error_code, pvm->exit_cr2,
-					     NULL, 0);
+#ifdef CONFIG_KVM_PVM_STATS
+		pvm->stats.pf_mmu_start_ns = local_clock();
+#endif
+		err = kvm_handle_page_fault(vcpu, error_code, pvm->exit_cr2,
+					    NULL, 0);
+#ifdef CONFIG_KVM_PVM_STATS
+		pvm->stats.pf_mmu_end_ns = local_clock();
+		if ((vcpu->arch.exception.pending || vcpu->arch.exception.injected) &&
+		    vcpu->arch.exception.vector == PF_VECTOR)
+			pvm->stats.last_exit_class =
+				(vcpu->arch.exception.error_code & PFERR_PRESENT_MASK) ?
+				PVM_EXIT_CLASS_PF_REFLECT_OTHER :
+				PVM_EXIT_CLASS_PF_REFLECT_NP;
+		else
+			pvm->stats.last_exit_class = PVM_EXIT_CLASS_PF_FIXED;
+#endif
+		return err;
 	case GP_VECTOR:
 		if (is_smod(pvm) && handle_synthetic_instruction_pvm_cpuid(vcpu))
 			return 1;
@@ -3026,6 +3137,119 @@ static noinstr void pvm_vcpu_run_noinstr(struct kvm_vcpu *vcpu)
 	guest_state_exit_irqoff();
 }
 
+#ifdef CONFIG_KVM_PVM_STATS
+/* Same CPU as the run: vcpu_enter_guest() holds preemption off across both. */
+static void pvm_stats_fold_switcher(struct vcpu_pvm *pvm)
+{
+	struct pvm_switcher_stats *sw = this_cpu_ptr(&cpu_tss_rw.tss_ex.stats);
+
+#define PVM_STAT_FOLD(name)	pvm->stats.sw.name += sw->name;
+	PVM_SWITCHER_STATS(PVM_STAT_FOLD)
+#undef PVM_STAT_FOLD
+	memset(sw, 0, sizeof(*sw));
+}
+
+/*
+ * pr_emerg, because this is read off a serial console by a harness that is
+ * not going to go looking in dmesg, and pr_info does not reach it during a
+ * guest run.
+ */
+static void pvm_stats_print_tagged(struct vcpu_pvm *pvm, const char *tag)
+{
+	struct pvm_stats *st = &pvm->stats;
+	char buf[1536];
+	int n;
+
+	if (!st->entries)
+		return;
+
+	n = scnprintf(buf, sizeof(buf), "%svcpu=%d", tag, pvm->vcpu.vcpu_id);
+#define PVM_STAT_PRINT(name)						\
+	n += scnprintf(buf + n, sizeof(buf) - n, " %s=%lu", #name, st->name);
+	PVM_HYPERVISOR_STATS(PVM_STAT_PRINT)
+#undef PVM_STAT_PRINT
+#define PVM_STAT_PRINT(name)						\
+	n += scnprintf(buf + n, sizeof(buf) - n, " %s=%lu", #name, st->sw.name);
+	PVM_SWITCHER_STATS(PVM_STAT_PRINT)
+#undef PVM_STAT_PRINT
+#define PVM_STAT_PRINT(name)						\
+	n += scnprintf(buf + n, sizeof(buf) - n, " %s=%llu", #name,	\
+		       (u64)pvm->vcpu.stat.name);
+	PVM_KVM_VCPU_STATS(PVM_STAT_PRINT)
+#undef PVM_STAT_PRINT
+	n += scnprintf(buf + n, sizeof(buf) - n,
+		       " mmu_lock_count=%llu mmu_lock_contended=%llu mmu_lock_wait_ns=%llu mmu_lock_hold_ns=%llu",
+		       pvm->vcpu.arch.mmu_lock_stats.count,
+		       pvm->vcpu.arch.mmu_lock_stats.contended,
+		       pvm->vcpu.arch.mmu_lock_stats.wait_ns,
+		       pvm->vcpu.arch.mmu_lock_stats.hold_ns);
+	pr_emerg("PVMSTATS: %s\n", buf);
+
+	n = scnprintf(buf, sizeof(buf), "%svcpu=%d", tag, pvm->vcpu.vcpu_id);
+#define PVM_STAT_PRINT(name)						\
+	n += scnprintf(buf + n, sizeof(buf) - n, " %s=%lu", #name, st->name);
+	PVM_DPF_STATS(PVM_STAT_PRINT)
+#undef PVM_STAT_PRINT
+	pr_emerg("PVMSTATS: %s\n", buf);
+
+	{
+		struct kvm_pf_reflect_stats *rs = &pvm->vcpu.arch.pf_reflect_stats;
+
+		pr_emerg("PVMSTATS: %svcpu=%d reflect_np=%llu reflect_np_user=%llu reflect_np_write=%llu reflect_np_fetch=%llu reflect_np_l1=%llu reflect_np_l2=%llu reflect_np_l3=%llu reflect_np_l4=%llu reflect_np_l5=%llu reflect_protection=%llu reflect_reserved=%llu reflect_pku=%llu exit_ns_other=%llu exit_n_other=%llu exit_ns_pf_fixed=%llu exit_n_pf_fixed=%llu exit_ns_pf_reflect_np=%llu exit_n_pf_reflect_np=%llu exit_ns_pf_reflect_other=%llu exit_n_pf_reflect_other=%llu\n",
+			 tag, pvm->vcpu.vcpu_id, rs->np, rs->np_user, rs->np_write,
+			 rs->np_fetch, rs->np_level[0], rs->np_level[1],
+			 rs->np_level[2], rs->np_level[3], rs->np_level[4],
+			 rs->protection, rs->reserved, rs->pku,
+			 st->exit_ns[0], st->exit_count[0], st->exit_ns[1], st->exit_count[1],
+			 st->exit_ns[2], st->exit_count[2], st->exit_ns[3], st->exit_count[3]);
+		pr_emerg("PVMSTATS: %svcpu=%d exit_ns_pf_direct=%llu exit_n_pf_direct=%llu fixed_pre_ns=%llu fixed_mmu_ns=%llu fixed_post_ns=%llu post0_ns=%llu post1_ns=%llu post2_ns=%llu post3_ns=%llu post4_ns=%llu post5_ns=%llu post6_ns=%llu post7_ns=%llu post8_ns=%llu post9_ns=%llu post10_ns=%llu post11_ns=%llu\n",
+			 tag, pvm->vcpu.vcpu_id, st->exit_ns[PVM_EXIT_CLASS_PF_DIRECT],
+			 st->exit_count[PVM_EXIT_CLASS_PF_DIRECT], st->fixed_pre_ns,
+			 st->fixed_mmu_ns, st->fixed_post_ns,
+			 st->fixed_post_part_ns[0], st->fixed_post_part_ns[1],
+			 st->fixed_post_part_ns[2], st->fixed_post_part_ns[3],
+			 st->fixed_post_part_ns[4], st->fixed_post_part_ns[5],
+			 st->fixed_post_part_ns[6], st->fixed_post_part_ns[7],
+			 st->fixed_post_part_ns[8], st->fixed_post_part_ns[9],
+			 st->fixed_post_part_ns[10], st->fixed_post_part_ns[11]);
+	}
+}
+
+static void pvm_stats_print(struct vcpu_pvm *pvm)
+{
+	pvm_stats_print_tagged(pvm, "");
+}
+
+/* MSR_PVM_STATS_MARK: every vCPU of the VM, and the VM, tagged with @mark. */
+static void pvm_stats_mark(struct kvm *kvm, u64 mark)
+{
+	struct kvm_vcpu *vcpu;
+	unsigned long i;
+	char tag[32], buf[512];
+	int n;
+
+	snprintf(tag, sizeof(tag), "mark=%llu ", mark);
+	kvm_for_each_vcpu(i, vcpu, kvm)
+		pvm_stats_print_tagged(to_pvm(vcpu), tag);
+
+	n = scnprintf(buf, sizeof(buf), "%sremote_tlb_flush=%llu remote_tlb_flush_requests=%llu",
+		      tag, (u64)kvm->stat.generic.remote_tlb_flush,
+		      (u64)kvm->stat.generic.remote_tlb_flush_requests);
+#define PVM_STAT_PRINT(name)						\
+	n += scnprintf(buf + n, sizeof(buf) - n, " %s=%llu", #name,	\
+		       (u64)kvm->stat.name);
+	PVM_KVM_VM_STATS(PVM_STAT_PRINT)
+#undef PVM_STAT_PRINT
+	n += scnprintf(buf + n, sizeof(buf) - n, " pages_4k=%lld pages_2m=%lld",
+		       atomic64_read(&kvm->stat.pages_4k),
+		       atomic64_read(&kvm->stat.pages_2m));
+	pr_emerg("PVMSTATS-VM: %s\n", buf);
+}
+#else
+static inline void pvm_stats_fold_switcher(struct vcpu_pvm *pvm) {}
+static inline void pvm_stats_print(struct vcpu_pvm *pvm) {}
+#endif
+
 /*
  * PVM wrappers for kvm_load_{guest|host}_xsave_state().
  *
@@ -3120,6 +3344,37 @@ static fastpath_t pvm_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 	}
 
 	trace_kvm_entry(vcpu, false);
+	pvm_stat_inc(pvm, entries);
+#ifdef CONFIG_KVM_PVM_STATS
+	if (pvm->stats.last_exit_ns) {
+		int c = pvm->stats.last_exit_class;
+		u64 now = local_clock();
+
+		pvm->stats.exit_ns[c] += now - pvm->stats.last_exit_ns;
+		pvm->stats.exit_count[c]++;
+		if (c == PVM_EXIT_CLASS_PF_FIXED &&
+		    pvm->stats.pf_mmu_start_ns >= pvm->stats.last_exit_ns) {
+			pvm->stats.fixed_pre_ns += pvm->stats.pf_mmu_start_ns -
+						   pvm->stats.last_exit_ns;
+			pvm->stats.fixed_mmu_ns += pvm->stats.pf_mmu_end_ns -
+						   pvm->stats.pf_mmu_start_ns;
+			pvm->stats.fixed_post_ns += now - pvm->stats.pf_mmu_end_ns;
+			{
+				static const int order[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 9 };
+				u64 *t = vcpu->arch.entry_stamp, prev = pvm->stats.pf_mmu_end_ns;
+				int i;
+
+				for (i = 0; i < ARRAY_SIZE(order) && t[order[i]] >= prev; i++) {
+					pvm->stats.fixed_post_part_ns[i] += t[order[i]] - prev;
+					prev = t[order[i]];
+				}
+				if (i == ARRAY_SIZE(order))
+					pvm->stats.fixed_post_part_ns[i] += now - prev;
+			}
+		}
+		pvm->stats.last_exit_ns = 0;
+	}
+#endif
 
 	pvm_load_guest_xsave_state(vcpu);
 
@@ -3140,6 +3395,11 @@ static fastpath_t pvm_vcpu_run(struct kvm_vcpu *vcpu, u64 run_flags)
 		update_debugctlmsr(0);
 
 	pvm_vcpu_run_noinstr(vcpu);
+	pvm_stats_fold_switcher(pvm);
+#ifdef CONFIG_KVM_PVM_STATS
+	pvm->stats.last_exit_ns = local_clock();
+	pvm->stats.last_exit_class = PVM_EXIT_CLASS_OTHER;
+#endif
 
 	if (is_smod_before_run != is_smod(pvm)) {
 		kvm_mmu_role_set_user(&vcpu->arch.mmu->root_role, !is_smod(pvm));
@@ -3328,6 +3588,7 @@ static void pvm_vcpu_free(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_pvm *pvm = to_pvm(vcpu);
 
+	pvm_stats_print(pvm);
 	pvm_unpin_vcpu_struct(pvm);
 }
 

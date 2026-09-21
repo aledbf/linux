@@ -147,6 +147,23 @@ struct pt_regs;
 struct pvm_vcpu_struct;
 
 /*
+ * What the switcher counts under CONFIG_KVM_PVM_STATS: the events that never
+ * reach the hypervisor, so it is the only one that can see them.  kvm-pvm
+ * folds them into the vCPU after every run.
+ */
+#define PVM_SWITCHER_STATS(X)						\
+	X(ds_to_smod)		/* direct switch, user -> supervisor */	\
+	X(ds_to_umod)		/* direct switch, supervisor -> user */	\
+	X(pgtbl_hit_paired)	/* LOAD_PGTBL served, pair loaded */	\
+	X(pgtbl_hit_unpaired)	/* LOAD_PGTBL served, NO_DS_CR3 set */	\
+	X(rdpkru)							\
+	X(wrpkru)							\
+	X(pkru_user_nonzero)	/* RDPKRU on the way in read non-zero */ \
+	X(dpf_direct)		/* user #PF delivered by the switcher */
+
+#define PVM_STAT_FIELD(name)	unsigned long name;
+
+/*
  * Per-CPU switcher state, kept in struct tss_struct.  The page-aligned
  * tss_struct has room for it without growing, as setup_cpu_entry_area()
  * asserts.
@@ -248,6 +265,12 @@ struct tss_extra {
 	unsigned long dpf_page;
 	u32 dpf_on;
 	u32 dpf_run;
+
+#ifdef CONFIG_KVM_PVM_STATS
+	struct pvm_switcher_stats {
+		PVM_SWITCHER_STATS(PVM_STAT_FIELD)
+	} stats;
+#endif
 } ____cacheline_aligned;
 
 extern struct pt_regs *switcher_enter_guest(void);

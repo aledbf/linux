@@ -832,8 +832,11 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
 	 * The page is not mapped by the guest.  Let the guest handle it.
 	 */
 	if (!r) {
-		if (!fault->prefetch)
+		if (!fault->prefetch) {
+			kvm_pf_reflect_stats_count(vcpu, walker.fault.error_code,
+						   walker.level);
 			__kvm_inject_emulated_page_fault(vcpu, &walker.fault, true);
+		}
 
 		return RET_PF_RETRY;
 	}
@@ -878,7 +881,7 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
 	}
 #endif
 
-	write_lock(&vcpu->kvm->mmu_lock);
+	kvm_mmu_lock_stats_lock(vcpu);
 
 	r = make_mmu_pages_available(vcpu);
 	if (r)
@@ -893,7 +896,7 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault
 
 out_unlock:
 	kvm_mmu_finish_page_fault(vcpu, fault, r);
-	write_unlock(&vcpu->kvm->mmu_lock);
+	kvm_mmu_lock_stats_unlock(vcpu);
 	return r;
 }
 

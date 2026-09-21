@@ -83,11 +83,118 @@ int host_mmu_init(void);
 #define PVM_ASID_GEN_RESERVED		0
 #define PVM_ASID_GEN_INIT		1
 
+/*
+ * CONFIG_KVM_PVM_STATS: what the hypervisor itself can count, beside what the
+ * switcher counts in tss_ex (PVM_SWITCHER_STATS).
+ */
+#define PVM_HYPERVISOR_STATS(X)						\
+	X(entries)							\
+	X(pgtbl_publish)		/* pvm_publish_pgtbl_cache() */	\
+	X(pgtbl_roots_scanned)		/* is_root_usable() calls in it */ \
+	X(pgtbl_published)		/* table entries it filled */	\
+	X(pgtbl_published_paired)	/* ... with a user-side root */	\
+	X(hc_load_pgtbl)		/* LOAD_PGTBL the switcher sent here */ \
+	X(hc_load_pgtbl_flags)		/* ... because of the flags word */ \
+	X(hc_invlpg)							\
+	X(hc_invlpg_seq)		/* one page on from the last, no exit between */ \
+	X(hc_wrmsr)			/* PVM_HC_WRMSR, by MSR below */ \
+	X(hc_wrmsr_icr)			/* x2APIC ICR */		\
+	X(hc_wrmsr_tsc_deadline)					\
+	X(hc_wrmsr_eoi)			/* x2APIC EOI */		\
+	X(hc_wrmsr_other)						\
+	X(hc_flush_all)							\
+	X(hc_flush_current)						\
+	X(pf_exit_smod)			/* #PF exits taken in supervisor mode */ \
+	X(pf_exit_umod)			/* ... and in user mode */	\
+	X(syscall_umod_exit)		/* user->supervisor via the hypervisor */ \
+	X(syscall_umod_exit_no_ds_cr3)					\
+	X(syscall_umod_exit_other)	/* another inhibitor */		\
+	X(eretu_exit)			/* supervisor->user via the hypervisor */ \
+	X(eretu_exit_no_ds_cr3)						\
+	X(eretu_exit_other)		/* another inhibitor */		\
+	X(eretu_exit_sel)		/* no inhibitor: CS/SS not the expected pair */
+
+/* Direct #PF delivery, on a line of its own: printk's limit. */
+#define PVM_DPF_STATS(X)						\
+	X(dpf_exit_delivered)		/* delivered by the exit handler */ \
+	X(dpf_refused_same_page)	/* the page of the delivery before */ \
+	X(dpf_refused_run)		/* PVM_DIRECT_PF_RUN in a row */
+
+/*
+ * The counters KVM itself keeps that say what the shadow MMU did, printed with
+ * PVM's own so that one snapshot holds both.
+ */
+#define PVM_KVM_VCPU_STATS(X)						\
+	X(exits) X(pf_taken) X(pf_fixed) X(pf_spurious) X(pf_emulate)	\
+	X(pf_fast) X(pf_guest) X(tlb_flush) X(invlpg) X(halt_exits)	\
+	X(irq_exits) X(hypercalls)
+
+#define PVM_KVM_VM_STATS(X)						\
+	X(mmu_shadow_zapped) X(mmu_pte_write) X(mmu_pde_zapped)		\
+	X(mmu_flooded) X(mmu_recycled) X(mmu_cache_miss) X(mmu_unsync)
+
+/*
+ * CONFIG_KVM_PVM_STATS only, and not part of the ABI: a write prints every
+ * counter of every vCPU of the VM, tagged with the value written, so that a
+ * guest can bracket one benchmark with two writes and the host log holds
+ * exactly that benchmark's counts.  The last PVM virtual MSR, which the ABI
+ * marks reserved.
+ */
+#define MSR_PVM_STATS_MARK		(PVM_VIRTUAL_MSR_BASE + 0xf)
+
 /* What PVM_CPUID_FEATURES.ebx reports and MSR_PVM_FEATURES_ENABLED accepts. */
 #define PVM_FEATURES_SUPPORTED		PVM_FEATURE_DIRECT_PF
 
+enum {
+	PVM_EXIT_CLASS_OTHER,
+	PVM_EXIT_CLASS_PF_FIXED,	/* #PF the shadow MMU resolved */
+	PVM_EXIT_CLASS_PF_REFLECT_NP,	/* #PF reflected, guest entry not present */
+	PVM_EXIT_CLASS_PF_REFLECT_OTHER, /* #PF reflected for another reason */
+	PVM_EXIT_CLASS_PF_DIRECT,	/* #PF delivered without the shadow MMU */
+	PVM_EXIT_CLASSES
+};
+
+#ifdef CONFIG_KVM_PVM_STATS
+struct pvm_stats {
+	PVM_HYPERVISOR_STATS(PVM_STAT_FIELD)
+	PVM_DPF_STATS(PVM_STAT_FIELD)
+	struct pvm_switcher_stats sw;
+	/* For hc_invlpg_seq. */
+	unsigned long last_invlpg_addr;
+	unsigned long last_invlpg_entry;
+	/*
+	 * Host time from one exit to the next entry, by what the exit was, so
+	 * that the cost of an exit class can be read off a benchmark.
+	 */
+	u64 exit_ns[PVM_EXIT_CLASSES], exit_count[PVM_EXIT_CLASSES];
+	u64 last_exit_ns;
+	int last_exit_class;
+	/*
+	 * A #PF exit the shadow MMU fixed, in three: from the exit to
+	 * kvm_handle_page_fault(), inside it, and from its return to the next
+	 * entry.
+	 */
+	u64 pf_mmu_start_ns, pf_mmu_end_ns;
+	u64 fixed_pre_ns, fixed_mmu_ns, fixed_post_ns;
+	/*
+	 * fixed_post_ns again, by the vcpu_enter_guest() stamps it passes, in
+	 * the order they are taken (0-8, 10, 9):
+	 * [0] handler return to vcpu_enter_guest(), [1] requests, [2] events,
+	 * [3] kvm_mmu_reload(), [4] prepare_switch_to_guest() and irq off,
+	 * [5] mode and exit-request check, [6] FPU, [7] kvm_load_xfeatures(),
+	 * [8] debug registers, [9] get_debugctlmsr(), [10] PMU load,
+	 * [11] to pvm_vcpu_run().
+	 */
+	u64 fixed_post_part_ns[12];
+};
+#endif
+
 struct vcpu_pvm {
 	struct kvm_vcpu vcpu;
+
+#ifdef CONFIG_KVM_PVM_STATS
+	struct pvm_stats stats;
+#endif
 
 	/* Guest RFLAGS, turned into hardware RFLAGS by the switcher. */
 	unsigned long rflags;

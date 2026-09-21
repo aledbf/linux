@@ -8079,6 +8079,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 
 	bool req_immediate_exit = false;
 
+	kvm_entry_stamp(vcpu, 0);
 	if (kvm_request_pending(vcpu)) {
 		if (kvm_check_request(KVM_REQ_VM_DEAD, vcpu)) {
 			r = -EIO;
@@ -8244,6 +8245,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 			kvm_x86_call(reload_pinned_pages)(vcpu);
 	}
 
+	kvm_entry_stamp(vcpu, 1);
 	if (kvm_check_request(KVM_REQ_EVENT, vcpu) || req_int_win ||
 	    kvm_xen_has_interrupt(vcpu)) {
 		++vcpu->stat.req_event;
@@ -8271,11 +8273,13 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		}
 	}
 
+	kvm_entry_stamp(vcpu, 2);
 	r = kvm_mmu_reload(vcpu);
 	if (unlikely(r)) {
 		goto cancel_injection;
 	}
 
+	kvm_entry_stamp(vcpu, 3);
 	preempt_disable();
 
 	kvm_x86_call(prepare_switch_to_guest)(vcpu);
@@ -8286,6 +8290,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 	 * result in virtual interrupt delivery.
 	 */
 	local_irq_disable();
+	kvm_entry_stamp(vcpu, 4);
 
 	/* Store vcpu->apicv_active before vcpu->mode.  */
 	smp_store_release(&vcpu->mode, IN_GUEST_MODE);
@@ -8332,6 +8337,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 		kvm_make_request(KVM_REQ_EVENT, vcpu);
 	}
 
+	kvm_entry_stamp(vcpu, 5);
 	fpregs_assert_state_consistent();
 	if (test_thread_flag(TIF_NEED_FPU_LOAD))
 		switch_fpu_return();
@@ -8339,7 +8345,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 	if (vcpu->arch.guest_fpu.xfd_err)
 		wrmsrq(MSR_IA32_XFD_ERR, vcpu->arch.guest_fpu.xfd_err);
 
+	kvm_entry_stamp(vcpu, 6);
 	kvm_load_xfeatures(vcpu, true);
+	kvm_entry_stamp(vcpu, 7);
 
 	if (unlikely(vcpu->arch.switch_db_regs &&
 		     !(vcpu->arch.switch_db_regs & KVM_DEBUGREG_AUTO_SWITCH))) {
@@ -8361,7 +8369,9 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 	 * vendor code if any host-owned bits were changed, e.g. so that the
 	 * value loaded into hardware while running the guest can be updated.
 	 */
+	kvm_entry_stamp(vcpu, 8);
 	debug_ctl = get_debugctlmsr();
+	kvm_entry_stamp(vcpu, 10);
 	if ((debug_ctl ^ vcpu->arch.host_debugctl) & kvm_x86_ops.HOST_OWNED_DEBUGCTL &&
 	    !vcpu->arch.guest_state_protected)
 		run_flags |= KVM_RUN_LOAD_DEBUGCTL;
@@ -8369,6 +8379,7 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
 
 	kvm_mediated_pmu_load(vcpu);
 
+	kvm_entry_stamp(vcpu, 9);
 	guest_timing_enter_irqoff();
 
 	/*

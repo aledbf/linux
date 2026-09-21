@@ -79,6 +79,18 @@ int main(void)
 	ENTRY(dpf_page);
 	ENTRY(dpf_on);
 	ENTRY(dpf_run);
+#ifdef CONFIG_KVM_PVM_STATS
+#define STAT(name) OFFSET(TSS_EX_stat_ ## name, tss_struct, tss_ex.stats.name)
+	STAT(ds_to_smod);
+	STAT(ds_to_umod);
+	STAT(pgtbl_hit_paired);
+	STAT(pgtbl_hit_unpaired);
+	STAT(rdpkru);
+	STAT(wrpkru);
+	STAT(dpf_direct);
+	STAT(pkru_user_nonzero);
+#undef STAT
+#endif
 	BLANK();
 #undef ENTRY
 	DEFINE(PVM_PGTBL_ENTRY_SIZE, sizeof(struct pvm_pgtbl_entry));

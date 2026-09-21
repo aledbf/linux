@@ -307,6 +307,19 @@ static inline bool kvm_check_has_quirk(struct kvm *kvm, u64 quirk)
 	return !(READ_ONCE(kvm->arch.disabled_quirks) & quirk);
 }
 
+#ifdef CONFIG_KVM_PVM_STATS
+#include <linux/sched/clock.h>
+
+static inline void kvm_entry_stamp(struct kvm_vcpu *vcpu, int i)
+{
+	vcpu->arch.entry_stamp[i] = local_clock();
+}
+#else
+static inline void kvm_entry_stamp(struct kvm_vcpu *vcpu, int i)
+{
+}
+#endif
+
 static __always_inline void kvm_request_l1tf_flush_l1d(void)
 {
 #if IS_ENABLED(CONFIG_CPU_MITIGATIONS) && IS_ENABLED(CONFIG_KVM_INTEL)

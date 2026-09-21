@@ -13,6 +13,16 @@
 #include "calling.h"
 
 /*
+ * CONFIG_KVM_PVM_STATS: count an event only the switcher sees.  An INC, so
+ * only where the flags are dead.
+ */
+#ifdef CONFIG_KVM_PVM_STATS
+#define PVM_STAT(name)	incq TSS_extra(stat_##name)
+#else
+#define PVM_STAT(name)
+#endif
+
+/*
  * One entry of the published page-table table.  The switcher only reads it;
  * pvm_publish_pgtbl_cache() rewrites the whole table before every VM entry.
  */
@@ -39,8 +49,10 @@
 	jz	1f
 	movq	%rdi, TSS_extra(umod_cr3)
 	andq	$~SWITCH_FLAGS_NO_DS_CR3, TSS_extra(switch_flags)
+	PVM_STAT(pgtbl_hit_paired)
 	jmp	2f
 1:	orq	$SWITCH_FLAGS_NO_DS_CR3, TSS_extra(switch_flags)
+	PVM_STAT(pgtbl_hit_unpaired)
 2:	movq	TSS_pgtbl(\i, smod_cr3), %rdi
 	jmp	.L_switcher_pgtbl_found
 .L_switcher_pgtbl_next_\i:
@@ -67,6 +79,14 @@
 	xorl	%ecx, %ecx
 	rdpkru
 	movl	%eax, PVCS_pkru(%rdi)
+#ifdef CONFIG_KVM_PVM_STATS
+	PVM_STAT(rdpkru)
+	PVM_STAT(wrpkru)
+	testl	%eax, %eax
+	jz	1f
+	PVM_STAT(pkru_user_nonzero)
+1:
+#endif
 	movl	TSS_extra(smod_pkru), %eax
 	xorl	%ecx, %ecx
 	xorl	%edx, %edx
@@ -81,6 +101,7 @@
 	je	.Lend_\@
 	pushq	%rax
 	pushq	%rdx
+	PVM_STAT(wrpkru)
 	movl	PVCS_pkru(%rdi), %eax
 	xorl	%ecx, %ecx
 	xorl	%edx, %edx
@@ -232,6 +253,7 @@ SYM_INNER_LABEL(entry_SYSCALL_64_switcher_safe_stack, SYM_L_GLOBAL)
 	jnz	.L_switcher_check_return_umod_instruction
 
 	/* Now it must be umod, start to do direct switch from umod to smod */
+	PVM_STAT(ds_to_smod)
 	movq	TSS_extra(pvcs), %rdi
 	movl	$PVCS_USER_CS_SS, PVCS_user_cs(%rdi)
 	movl	%r11d, PVCS_eflags(%rdi)
@@ -310,6 +332,8 @@ SYM_INNER_LABEL(entry_SYSRETQ_switcher_unsafe_stack, SYM_L_GLOBAL)
 	movq	TSS_extra(pvcs), %rdi
 	cmpl	$PVCS_USER_CS_SS, PVCS_user_cs(%rdi)
 	jne	.L_switcher_return_to_hypervisor
+
+	PVM_STAT(ds_to_umod)
 
 	/* switch smod to umod (switch_flags & cr3) */
 	xorb	$SWITCH_FLAGS_MOD_TOGGLE, TSS_extra(switch_flags)
@@ -499,6 +523,7 @@ SYM_CODE_START(pvm_direct_page_fault)
 	movq	%rax, TSS_extra(dpf_page)
 	movq	%rdi, %rax
 	movq	TSS_extra(pvcs), %rdi
+	PVM_STAT(dpf_direct)
 
 	/* The guest's own %rcx and %r11: a #PF, unlike SYSCALL, keeps them. */
 	movq	%rcx, PVCS_rcx(%rdi)

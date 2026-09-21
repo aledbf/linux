@@ -345,4 +345,73 @@ void track_possible_nx_huge_page(struct kvm *kvm, struct kvm_mmu_page *sp,
 void untrack_possible_nx_huge_page(struct kvm *kvm, struct kvm_mmu_page *sp,
 				   enum kvm_mmu_type mmu_type);
 
+/*
+ * The shadow MMU page fault path's mmu_lock, measured when
+ * CONFIG_KVM_PVM_STATS asks for it: a failed trylock first counts as
+ * contention, and the wait and the hold are timed with local_clock().
+ */
+#ifdef CONFIG_KVM_PVM_STATS
+#include <linux/sched/clock.h>
+
+static inline void kvm_mmu_lock_stats_lock(struct kvm_vcpu *vcpu)
+{
+	struct kvm_mmu_lock_stats *st = &vcpu->arch.mmu_lock_stats;
+	u64 t0;
+
+	st->count++;
+	if (write_trylock(&vcpu->kvm->mmu_lock)) {
+		st->hold_start = local_clock();
+		return;
+	}
+	st->contended++;
+	t0 = local_clock();
+	write_lock(&vcpu->kvm->mmu_lock);
+	st->hold_start = local_clock();
+	st->wait_ns += st->hold_start - t0;
+}
+
+static inline void kvm_mmu_lock_stats_unlock(struct kvm_vcpu *vcpu)
+{
+	struct kvm_mmu_lock_stats *st = &vcpu->arch.mmu_lock_stats;
+
+	st->hold_ns += local_clock() - st->hold_start;
+	write_unlock(&vcpu->kvm->mmu_lock);
+}
+static inline void kvm_pf_reflect_stats_count(struct kvm_vcpu *vcpu,
+					      u64 error_code, int level)
+{
+	struct kvm_pf_reflect_stats *st = &vcpu->arch.pf_reflect_stats;
+
+	if (!(error_code & PFERR_PRESENT_MASK)) {
+		st->np++;
+		st->np_user += !!(error_code & PFERR_USER_MASK);
+		st->np_write += !!(error_code & PFERR_WRITE_MASK);
+		st->np_fetch += !!(error_code & PFERR_FETCH_MASK);
+		if (level >= 1 && level <= 5)
+			st->np_level[level - 1]++;
+	} else if (error_code & PFERR_RSVD_MASK) {
+		st->reserved++;
+	} else if (error_code & PFERR_PK_MASK) {
+		st->pku++;
+	} else {
+		st->protection++;
+	}
+}
+#else
+static inline void kvm_pf_reflect_stats_count(struct kvm_vcpu *vcpu,
+					      u64 error_code, int level)
+{
+}
+
+static inline void kvm_mmu_lock_stats_lock(struct kvm_vcpu *vcpu)
+{
+	write_lock(&vcpu->kvm->mmu_lock);
+}
+
+static inline void kvm_mmu_lock_stats_unlock(struct kvm_vcpu *vcpu)
+{
+	write_unlock(&vcpu->kvm->mmu_lock);
+}
+#endif
+
 #endif /* __KVM_X86_MMU_INTERNAL_H */
