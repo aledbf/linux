@@ -41,10 +41,11 @@ static __init void clone_host_mmu(u64 *spt, u64 *host)
 u64 *host_mmu_root_pgd;
 
 /*
- * The root a guest runs on must map nothing of host user space, and every host
- * mapping cloned into it must have lost _PAGE_USER, since that bit is the only
- * thing standing between a CPL3 guest and host kernel memory through the
- * shared root.  SPTE_MMU_PRESENT_MASK goes with it: a cloned host entry is not
+ * S6 and M2 in Documentation/virt/kvm/x86/pvm-invariants.rst: the root a
+ * guest runs on must map nothing of host user space, and every host mapping
+ * cloned into it must have lost _PAGE_USER, since that bit is the only thing
+ * standing between a CPL3 guest and host kernel memory through the shared
+ * root.  SPTE_MMU_PRESENT_MASK goes with it: a cloned host entry is not
  * a shadow page and must not be walked as one.
  *
  * Both hold by construction -- the page is zeroed and clone_host_mmu() starts

@@ -350,7 +350,8 @@ static inline bool sp_ad_disabled(struct kvm_mmu_page *sp)
 
 /*
  * A guest at hardware CPL3 only has legacy shadow SPTEs, which always use A/D
- * bits, and bits 60-61 of its leaf SPTEs are part of the protection key.
+ * bits, and bits 60-61 of its leaf SPTEs are part of the protection key; see
+ * M8 in Documentation/virt/kvm/x86/pvm-invariants.rst.
  */
 static inline bool spte_ad_enabled(u64 spte)
 {

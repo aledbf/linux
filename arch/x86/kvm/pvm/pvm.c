@@ -182,11 +182,11 @@ static inline bool pvm_guest_uses_pku(struct kvm_vcpu *vcpu)
 }
 
 /*
- * A PVM guest lives in the lower half and nothing else.  The
- * upper half is the host's, which is what lets the guest run at hardware CPL3
- * inside it, so the guest's confinement is the sign bit -- the same test the
- * hardware applies to a CPL3 process, and nothing the hypervisor has to grant,
- * encode or re-derive.
+ * M7 in Documentation/virt/kvm/x86/pvm-invariants.rst: a PVM guest lives in
+ * the lower half and nothing else.  The upper half is the host's, which is
+ * what lets the guest run at hardware CPL3 inside it, so the guest's
+ * confinement is the sign bit -- the same test the hardware applies to a CPL3
+ * process, and nothing the hypervisor has to grant, encode or re-derive.
  */
 static __always_inline bool pvm_guest_allowed_va(struct kvm_vcpu *vcpu, u64 va)
 {
@@ -2472,8 +2472,8 @@ static bool handle_synthetic_instruction_pvm_cpuid(struct kvm_vcpu *vcpu)
  *
  * The switcher applies the same rule to the same state (tss_ex.dpf_run and
  * tss_ex.dpf_page) in pvm_direct_page_fault in entry_64_switcher.S; the two
- * must stay identical.  The error code and repeat tests are the helpers in
- * <asm/pvm_switcher.h>, next to the constants the assembly uses.
+ * must stay identical (S12).  The error code and repeat tests are the helpers
+ * in <asm/pvm_switcher.h>, next to the constants the assembly uses.
  */
 static bool pvm_direct_pf_candidate(struct vcpu_pvm *pvm, u32 hw_error_code,
 				    unsigned long cr2)
@@ -3814,7 +3814,7 @@ module_exit(pvm_exit);
 static int __init hardware_cap_check(void)
 {
 	/*
-	 * The PVM and the host PCID spaces must be disjoint.  The lowest PCID
+	 * S7: the PVM and host PCID spaces must be disjoint.  The lowest PCID
 	 * PVM can emit is PVM_ASID_MIN << PVM_ASID_SHIFT and the host's dynamic
 	 * ASIDs run up to TLB_NR_DYN_ASIDS, so that is the whole requirement.
 	 * TLB_NR_DYN_ASIDS is taken from <asm/tlbflush.h> rather than restated
@@ -3830,7 +3830,8 @@ static int __init hardware_cap_check(void)
 	BUILD_BUG_ON((PVM_CPUID_MAX & ~0xffU) != PVM_CPUID_SIGNATURE);
 
 	/*
-	 * The hardware floor, and the switcher's hooks in the host entry code.
+	 * S9: the hardware floor, and the switcher's hooks in the host entry
+	 * code.
 	 * X86_FEATURE_PVM_HOST is set at boot only for a kernel booted with
 	 * pvm_host on a host without KPTI or FRED, with FSGSBASE, PCID and
 	 * INVPCID, and not a Xen PV guest; the boot log says which one failed.

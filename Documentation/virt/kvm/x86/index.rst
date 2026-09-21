@@ -15,6 +15,7 @@ KVM for x86 systems
    mmu
    msr
    nested-vmx
+   pvm-invariants
    pvm-spec
    running-nested-guests
    timekeeping

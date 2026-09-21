@@ -373,6 +373,7 @@ SYM_INNER_LABEL(entry_SYSRETQ_switcher_unsafe_stack, SYM_L_GLOBAL)
 	 * CR3 below comes from that table, which the hypervisor rebuilds from
 	 * its cached shadow roots before every entry, so a root it has since
 	 * dropped is never there and the guest cannot name anything else.
+	 * S6 in Documentation/virt/kvm/x86/pvm-invariants.rst.
 	 *
 	 * Only the exact request the hypervisor said needs nothing but the
 	 * load: no TLB flush, and the paging level the guest already has.
@@ -456,7 +457,8 @@ EXPORT_SYMBOL_GPL(entry_SYSCALL_64_switcher)
  *    same rule to the same state and sends it to the shadow MMU.
  *
  * pvm_direct_pf_candidate() in kvm-pvm is the same rule in C, built on the
- * same helpers; a change here must be made there too.
+ * same helpers; a change here must be made there too.  S12 in
+ * Documentation/virt/kvm/x86/pvm-invariants.rst.
  */
 SYM_CODE_START(pvm_direct_page_fault)
 	UNWIND_HINT_IRET_ENTRY offset=8

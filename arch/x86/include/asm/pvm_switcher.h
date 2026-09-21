@@ -17,7 +17,9 @@
  *  - The PVCS (struct pvm_vcpu_struct), which the switcher's direct mode
  *    switches read and write through tss_extra.pvcs.
  *
- * The assembly sees these through asm-offsets_64.c.
+ * The assembly sees these through asm-offsets_64.c.  What the switcher and
+ * the hypervisor must maintain for this to be safe is listed, as S1-S12, in
+ * Documentation/virt/kvm/x86/pvm-invariants.rst.
  */
 
 #ifdef CONFIG_X86_PVM_SWITCHER
