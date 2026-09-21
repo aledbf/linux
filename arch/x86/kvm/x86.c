@@ -6104,7 +6104,7 @@ static int handle_emulation_failure(struct kvm_vcpu *vcpu, int emulation_type)
 	++vcpu->stat.insn_emulation_fail;
 	trace_kvm_emulate_insn_failed(vcpu);
 
-	if (emulation_type & EMULTYPE_VMWARE_GP) {
+	if (emulation_type & (EMULTYPE_VMWARE_GP | EMULTYPE_TRAP_GP)) {
 		kvm_queue_exception_e(vcpu, GP_VECTOR, 0);
 		return 1;
 	}
@@ -6246,7 +6246,8 @@ static bool kvm_vcpu_check_code_breakpoint(struct kvm_vcpu *vcpu,
 	 * and without a prefix.
 	 */
 	if (emulation_type & (EMULTYPE_NO_DECODE | EMULTYPE_SKIP |
-			      EMULTYPE_TRAP_UD | EMULTYPE_VMWARE_GP | EMULTYPE_PF))
+			      EMULTYPE_TRAP_UD | EMULTYPE_VMWARE_GP |
+			      EMULTYPE_TRAP_GP | EMULTYPE_PF))
 		return false;
 
 	if (unlikely(dr7 & DR7_BP_EN_MASK) &&

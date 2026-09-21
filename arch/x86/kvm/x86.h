@@ -434,6 +434,11 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
  *                          an instruction if it could generate a given software
  *                          interrupt, which must be encoded via
  *                          EMULTYPE_SET_SOFT_INT_VECTOR().
+ *
+ * EMULTYPE_TRAP_GP - Set when emulating an intercepted #GP from hardware, for
+ *		      a vendor whose guest runs its privileged code at CPL3.
+ *		      If the instruction cannot be emulated, the #GP is
+ *		      reinjected instead of a #UD.
  */
 #define EMULTYPE_NO_DECODE	    (1 << 0)
 #define EMULTYPE_TRAP_UD	    (1 << 1)
@@ -445,6 +450,7 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 #define EMULTYPE_COMPLETE_USER_EXIT (1 << 7)
 #define EMULTYPE_WRITE_PF_TO_SP	    (1 << 8)
 #define EMULTYPE_SKIP_SOFT_INT	    (1 << 9)
+#define EMULTYPE_TRAP_GP	    (1 << 10)
 
 #define EMULTYPE_SET_SOFT_INT_VECTOR(v)	((u32)((v) & 0xff) << 16)
 #define EMULTYPE_GET_SOFT_INT_VECTOR(e)	(((e) >> 16) & 0xff)
