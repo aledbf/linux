@@ -14683,6 +14683,18 @@ F:	arch/x86/kvm/svm/hyperv.*
 F:	arch/x86/kvm/svm/svm_onhyperv.*
 F:	arch/x86/kvm/vmx/hyperv.*
 
+KVM X86 PVM (KVM/pvm)
+L:	kvm@vger.kernel.org
+S:	Maintained
+F:	Documentation/virt/kvm/x86/pvm-*.rst
+F:	arch/x86/boot/startup/pvm_startup.c
+F:	arch/x86/entry/entry_64_pvm.S
+F:	arch/x86/entry/entry_64_switcher.S
+F:	arch/x86/include/asm/pvm_*.h
+F:	arch/x86/include/uapi/asm/pvm_*.h
+F:	arch/x86/kernel/pvm*.c
+F:	arch/x86/kvm/pvm/
+
 KVM X86 Xen (KVM/Xen)
 M:	David Woodhouse <dwmw2@infradead.org>
 M:	Paul Durrant <paul@xen.org>
