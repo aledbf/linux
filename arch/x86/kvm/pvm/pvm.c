@@ -108,6 +108,44 @@ static inline void __load_fs_base(struct vcpu_pvm *pvm)
 	wrmsrq(MSR_FS_BASE, pvm->segments[VCPU_SREG_FS].base);
 }
 
+/*
+ * The GS base the guest runs with is written to the hardware, which faults on
+ * a non-canonical value.  Some of the values come straight from the guest --
+ * PVCS::user_gsbase on the ERETU hypercall -- so canonicalize them at the
+ * host's address width, as the switcher does on its own ERETU path.
+ */
+static void pvm_write_guest_gs_base(struct vcpu_pvm *pvm, u64 data)
+{
+	data = __canonical_address(data, cpu_feature_enabled(X86_FEATURE_LA57) ?
+				   57 : 48);
+
+	preempt_disable();
+	pvm->segments[VCPU_SREG_GS].base = data;
+	if (pvm->loaded_cpu_state)
+		__load_gs_base(pvm);
+	preempt_enable();
+}
+
+/*
+ * A PVM guest lives in the lower half and nothing else.  The
+ * upper half is the host's, which is what lets the guest run at hardware CPL3
+ * inside it, so the guest's confinement is the sign bit -- the same test the
+ * hardware applies to a CPL3 process, and nothing the hypervisor has to grant,
+ * encode or re-derive.
+ */
+static __always_inline bool pvm_guest_allowed_va(struct kvm_vcpu *vcpu, u64 va)
+{
+	return (s64)va >= 0;
+}
+
+static bool pvm_disallowed_va(struct kvm_vcpu *vcpu, u64 va)
+{
+	if (is_noncanonical_address(va, vcpu, 0))
+		return true;
+
+	return !pvm_guest_allowed_va(vcpu, va);
+}
+
 static void __set_cpuid_faulting(bool on)
 {
 	u64 msrval;
@@ -189,6 +227,42 @@ static bool try_to_convert_to_pvm_mode(struct kvm_vcpu *vcpu)
 	pvm->nmi_mask = 0;
 
 	return true;
+}
+
+/*
+ * switch_to_smod() and switch_to_umod() switch the mode (smod/umod) and the
+ * CR3.  No vTLB flushing when switching the CR3 per PVM Spec.
+ *
+ * ACC_USER_MASK in the root role is the whole of the guest's kernel/user
+ * split.  The two roots share a guest CR3 and are told apart by this bit
+ * alone, which is why nothing may merge shadow pages whose role.access
+ * differs in it.  kvm_mmu_find_shadow_page() compares the whole role.word,
+ * so that holds by construction.  Sharing non-leaf shadow pages between the
+ * two roots is not an optimisation to make: most of the tree below them is
+ * identical, but sharing it fuses the trees this bit separates, which is
+ * what emulating SMEP with NX depends on.
+ */
+static inline void switch_to_smod(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	pvm_switch_flags_toggle_mod(pvm);
+	kvm_mmu_role_set_user(&vcpu->arch.mmu->root_role, false);
+	kvm_mmu_new_pgd(vcpu, vcpu->arch.cr3);
+
+	pvm_write_guest_gs_base(pvm, pvm->msr_kernel_gs_base);
+
+	pvm->hw_cs = __USER_CS;
+	pvm->hw_ss = __USER_DS;
+}
+
+static inline void switch_to_umod(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	pvm_switch_flags_toggle_mod(pvm);
+	kvm_mmu_role_set_user(&vcpu->arch.mmu->root_role, true);
+	kvm_mmu_new_pgd(vcpu, vcpu->arch.cr3);
 }
 
 /*
@@ -381,6 +455,117 @@ struct pvm_asid_data {
 };
 
 static DEFINE_PER_CPU(struct pvm_asid_data, pvm_asid);
+
+static bool is_asid_clean(struct vcpu_pvm *pvm)
+{
+	struct pvm_asid_data *asid_data = this_cpu_ptr(&pvm_asid);
+
+	return pvm->asid_generation == asid_data->asid_generation;
+}
+
+static inline u32 guest_pcid_to_host_pcid(struct vcpu_pvm *pvm, u32 guest_pcid, bool is_smod)
+{
+	u32 pcid;
+
+	if (guest_pcid & ~PVM_GUEST_PCID_MASK)
+		guest_pcid = 0;
+	pcid = (pvm->asid << PVM_ASID_SHIFT) | (guest_pcid & PVM_GUEST_PCID_MASK);
+	if (!is_smod)
+		pcid |= PVM_UMOD_PCID_MASK;
+
+	return pcid;
+}
+
+static void pvm_flush_hwtlb(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	pvm->asid_generation = PVM_ASID_GEN_RESERVED;
+}
+
+static void pvm_flush_hwtlb_current(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	pvm->flush_hwtlb_current = true;
+}
+
+/*
+ * Flush @addr from the host PCID a cached root runs on.  The mode of a root is
+ * role.access, not role.word: ACC_USER_MASK is an access bit.
+ */
+static void pvm_flush_hwtlb_root_gva(struct vcpu_pvm *pvm,
+				     struct kvm_mmu_root_info *root, gva_t addr)
+{
+	u32 pcid;
+	bool smod;
+
+	if (!VALID_PAGE(root->hpa))
+		return;
+
+	pcid = kvm_get_pcid(&pvm->vcpu, root->pgd);
+	smod = !(root_to_sp(root->hpa)->role.access & ACC_USER_MASK);
+	invpcid_flush_one(guest_pcid_to_host_pcid(pvm, pcid, smod), addr);
+}
+
+/*
+ * PVM_HC_TLB_INVLPG is for every tag, so the current root and every cached
+ * root, both halves of each pair: the guest may switch mode without an exit.
+ */
+static void pvm_flush_hwtlb_gva(struct kvm_vcpu *vcpu, gva_t addr, bool *full)
+{
+	struct kvm_mmu *mmu = vcpu->arch.mmu;
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+	int i;
+
+	get_cpu();
+	if (!is_asid_clean(pvm)) {
+		put_cpu();
+		return;
+	}
+
+	pvm_flush_hwtlb_root_gva(pvm, &mmu->root, addr);
+	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
+		pvm_flush_hwtlb_root_gva(pvm, &mmu->prev_roots[i], addr);
+
+	put_cpu();
+}
+
+static void pvm_load_mmu_pgd(struct kvm_vcpu *vcpu, hpa_t root_hpa,
+			     int root_level)
+{
+	/* Nothing to do. Guest cr3 will be prepared in pvm_set_host_cr3(). */
+}
+
+static DEFINE_PER_CPU(struct vcpu_pvm *, active_pvm_vcpu);
+
+/*
+ * Switches to specified vcpu, until a matching vcpu_put(), but assumes
+ * vcpu mutex is already taken.
+ */
+static void pvm_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	pvm->host_debugctlmsr = get_debugctlmsr();
+
+	if (__this_cpu_read(active_pvm_vcpu) == pvm && vcpu->cpu == cpu)
+		return;
+
+	__this_cpu_write(active_pvm_vcpu, pvm);
+
+	if (vcpu->cpu != cpu)
+		pvm_flush_hwtlb(vcpu);
+
+	indirect_branch_prediction_barrier();
+}
+
+static void pvm_vcpu_put(struct kvm_vcpu *vcpu)
+{
+	struct vcpu_pvm *pvm = to_pvm(vcpu);
+
+	pvm_prepare_switch_to_host(pvm);
+}
 
 static void pvm_cache_reg(struct kvm_vcpu *vcpu, enum kvm_reg reg)
 {
@@ -976,6 +1161,8 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.vcpu_create = pvm_vcpu_create,
 
 	.prepare_switch_to_guest = pvm_prepare_switch_to_guest,
+	.vcpu_load = pvm_vcpu_load,
+	.vcpu_put = pvm_vcpu_put,
 
 	.get_segment_base = pvm_get_segment_base,
 	.get_segment = pvm_get_segment,
@@ -986,6 +1173,7 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.get_cs_db_l_bits = pvm_get_cs_db_l_bits,
 	.is_valid_cr0 = pvm_is_valid_cr0,
 	.set_cr0 = pvm_set_cr0,
+	.load_mmu_pgd = pvm_load_mmu_pgd,
 	.is_valid_cr4 = pvm_is_valid_cr4,
 	.set_cr4 = pvm_set_cr4,
 	.set_efer = pvm_set_efer,
@@ -994,6 +1182,11 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.get_idt = pvm_get_idt,
 	.set_idt = pvm_set_idt,
 	.cache_reg = pvm_cache_reg,
+
+	.flush_tlb_all = pvm_flush_hwtlb,
+	.flush_tlb_current = pvm_flush_hwtlb_current,
+	.flush_tlb_gva = pvm_flush_hwtlb_gva,
+	.flush_tlb_guest = pvm_flush_hwtlb,
 
 	.set_interrupt_shadow = pvm_set_interrupt_shadow,
 	.get_interrupt_shadow = pvm_get_interrupt_shadow,
@@ -1004,6 +1197,8 @@ static struct kvm_x86_ops pvm_x86_ops __initdata = {
 	.leave_smm = pvm_leave_smm,
 	.enable_smi_window = pvm_enable_smi_window,
 #endif
+
+	.disallowed_va = pvm_disallowed_va,
 };
 
 static struct kvm_x86_init_ops pvm_init_ops __initdata = {
