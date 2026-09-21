@@ -5,6 +5,10 @@
 
 #include <asm/ia32.h>
 
+#ifdef CONFIG_PVM_GUEST
+#include <asm/pvm_para.h>
+#endif
+
 #if defined(CONFIG_KVM_GUEST)
 #include <asm/kvm_para.h>
 #endif
@@ -53,6 +57,38 @@ int main(void)
 	ENTRY(gdt_desc);
 	BLANK();
 #undef ENTRY
+
+#ifdef CONFIG_PVM_GUEST
+#define ENTRY(entry) OFFSET(PVCS_ ## entry, pvm_vcpu_struct, entry)
+	ENTRY(event_flags);
+	ENTRY(cr2);
+	ENTRY(event_errcode);
+	ENTRY(event_vector);
+	ENTRY(user_cs);
+	ENTRY(user_ss);
+	ENTRY(user_gsbase);
+	ENTRY(eflags);
+	ENTRY(rip);
+	ENTRY(rcx);
+	ENTRY(r11);
+	BLANK();
+#undef ENTRY
+
+	/* The PVCS layout is ABI, see Documentation/virt/kvm/x86/pvm-spec.rst. */
+	BUILD_BUG_ON(sizeof(struct pvm_vcpu_struct) != 128);
+	BUILD_BUG_ON(offsetof(struct pvm_vcpu_struct, event_flags) != 0x00);
+	BUILD_BUG_ON(offsetof(struct pvm_vcpu_struct, cr2) != 0x08);
+	BUILD_BUG_ON(offsetof(struct pvm_vcpu_struct, user_cs) != 0x40);
+	BUILD_BUG_ON(offsetof(struct pvm_vcpu_struct, user_ss) != 0x42);
+	BUILD_BUG_ON(offsetof(struct pvm_vcpu_struct, event_errcode) != 0x44);
+	BUILD_BUG_ON(offsetof(struct pvm_vcpu_struct, event_vector) != 0x46);
+	BUILD_BUG_ON(offsetof(struct pvm_vcpu_struct, user_gsbase) != 0x48);
+	BUILD_BUG_ON(offsetof(struct pvm_vcpu_struct, eflags) != 0x50);
+	BUILD_BUG_ON(offsetof(struct pvm_vcpu_struct, pkru) != 0x54);
+	BUILD_BUG_ON(offsetof(struct pvm_vcpu_struct, rip) != 0x58);
+	BUILD_BUG_ON(offsetof(struct pvm_vcpu_struct, rcx) != 0x60);
+	BUILD_BUG_ON(offsetof(struct pvm_vcpu_struct, r11) != 0x68);
+#endif
 
 	return 0;
 }

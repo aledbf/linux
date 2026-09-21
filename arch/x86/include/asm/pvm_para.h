@@ -7,7 +7,10 @@
 #ifndef __ASSEMBLER__
 #include <linux/init.h>
 
+struct pt_regs;
+
 #ifdef CONFIG_PVM_GUEST
+#include <linux/percpu-defs.h>
 #include <asm/irqflags.h>
 #include <uapi/asm/kvm_para.h>
 
@@ -20,8 +23,13 @@
 
 extern bool pvm_detected;
 
+/* This CPU's PVCS, registered with MSR_PVM_VCPU_STRUCT; see pvm_register_pvcs(). */
+DECLARE_PER_CPU_PAGE_ALIGNED(struct pvm_vcpu_struct, pvm_vcpu_struct);
+
 void __init pvm_relocate_kernel(unsigned long physbase);
 void __init pvm_early_setup(void);
+void pvm_register_pvcs(void);
+void pvm_setup_event_handling(void);
 bool __init pvm_kernel_layout_relocate(void);
 
 /* The page tables the PVH entry point runs on, from platform/pvh/head.S. */
@@ -104,6 +112,14 @@ static inline void pvm_early_setup(void)
 {
 }
 
+static inline void pvm_register_pvcs(void)
+{
+}
+
+static inline void pvm_setup_event_handling(void)
+{
+}
+
 static inline bool pvm_kernel_layout_relocate(void)
 {
 	return false;
@@ -111,7 +127,17 @@ static inline bool pvm_kernel_layout_relocate(void)
 #endif /* CONFIG_PVM_GUEST */
 
 /* Entry points and paravirt ops in entry_64_pvm.S */
+void entry_SYSCALL_64_pvm(void);
+void pvm_user_event_entry(void);
+void pvm_retu_rip(void);
 void pvm_hypercall(void);
+void pvm_save_fl(void);
+void pvm_irq_disable(void);
+void pvm_irq_enable(void);
+void pvm_read_cr2(void);
+
+/* Called from entry_64_pvm.S */
+void pvm_event(struct pt_regs *regs, u32 vector, u32 errcode);
 #endif /* !__ASSEMBLER__ */
 
 #endif /* _ASM_X86_PVM_PARA_H */

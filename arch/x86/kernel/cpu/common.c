@@ -68,6 +68,7 @@
 #include <asm/uv/uv.h>
 #include <asm/ia32.h>
 #include <asm/set_memory.h>
+#include <asm/pvm_para.h>
 #include <asm/traps.h>
 #include <asm/sev.h>
 #include <asm/tdx.h>
@@ -810,6 +811,8 @@ void __init switch_gdt_and_percpu_base(int cpu)
 	 * per CPU stack canary is 0 in both per CPU areas.
 	 */
 	wrmsrq(MSR_GS_BASE, cpu_kernelmode_gs_base(cpu));
+	/* A PVM guest's PVCS is per CPU data and has just moved. */
+	pvm_register_pvcs();
 #else
 	/*
 	 * %fs is already set to __KERNEL_PERCPU, but after switching GDT
@@ -2273,7 +2276,10 @@ static void wrmsrq_cstar(unsigned long val)
 
 static inline void idt_syscall_init(void)
 {
-	wrmsrq(MSR_LSTAR, (unsigned long)entry_SYSCALL_64);
+	if (cpu_feature_enabled(X86_FEATURE_KVM_PVM_GUEST))
+		wrmsrq(MSR_LSTAR, (unsigned long)entry_SYSCALL_64_pvm);
+	else
+		wrmsrq(MSR_LSTAR, (unsigned long)entry_SYSCALL_64);
 
 	if (ia32_enabled()) {
 		wrmsrq_cstar((unsigned long)entry_SYSCALL_compat);
@@ -2455,6 +2461,8 @@ void cpu_init_exception_handling(bool boot_cpu)
 	} else {
 		load_current_idt();
 	}
+
+	pvm_setup_event_handling();
 }
 
 void __init cpu_init_replace_early_idt(void)

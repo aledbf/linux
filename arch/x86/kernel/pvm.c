@@ -154,6 +154,20 @@ static void pvm_load_tls(struct thread_struct *t, unsigned int cpu)
 	}
 }
 
+static noinstr void pvm_safe_halt(void)
+{
+	pvm_hypercall0(PVM_HC_IRQ_HLT);
+}
+
+/*
+ * The PVCS holds the guest's CR2: the hypervisor fills it in when it delivers
+ * a #PF and reads it back on every exit.
+ */
+static noinstr void pvm_write_cr2(unsigned long cr2)
+{
+	this_cpu_write(pvm_vcpu_struct.cr2, cr2);
+}
+
 static unsigned long pvm_read_cr3(void)
 {
 	return this_cpu_read(pvm_guest_cr3);
@@ -183,6 +197,116 @@ static void pvm_flush_tlb_kernel(void)
 static void pvm_flush_tlb_one_user(unsigned long addr)
 {
 	pvm_hypercall1(PVM_HC_TLB_INVLPG, addr);
+}
+
+static noinstr void pvm_bad_event(struct pt_regs *regs, unsigned long vector,
+				  unsigned long error_code)
+{
+	irqentry_state_t irq_state = irqentry_nmi_enter(regs);
+
+	instrumentation_begin();
+
+	/* In NMI context die() panics. */
+	if (!user_mode(regs)) {
+		pr_emerg("invalid or fatal PVM event: vector %lu\n", vector);
+		die("invalid or fatal PVM event", regs, error_code);
+	} else {
+		unsigned long flags = oops_begin();
+		int sig = SIGKILL;
+
+		pr_alert("BUG: invalid or fatal PVM event; vector %lu error 0x%lx at %04lx:%016lx\n",
+			 vector, error_code, (unsigned long)regs->cs, regs->ip);
+
+		if (__die("Invalid or fatal PVM event", regs, error_code))
+			sig = 0;
+
+		oops_end(flags, regs, sig);
+	}
+	instrumentation_end();
+	irqentry_nmi_exit(regs, irq_state);
+}
+
+/* There is no IST on PVM; pick the handler by the mode the event came from. */
+static noinstr void pvm_exc_debug(struct pt_regs *regs)
+{
+	if (user_mode(regs))
+		noist_exc_debug(regs);
+	else
+		exc_debug(regs);
+}
+
+#ifdef CONFIG_X86_MCE
+static noinstr void pvm_exc_machine_check(struct pt_regs *regs)
+{
+	if (user_mode(regs))
+		noist_exc_machine_check(regs);
+	else
+		exc_machine_check(regs);
+}
+#endif
+
+static noinstr void pvm_exception(struct pt_regs *regs, unsigned long vector,
+				  unsigned long error_code)
+{
+	switch (vector) {
+	case X86_TRAP_DE: return exc_divide_error(regs);
+	case X86_TRAP_DB: return pvm_exc_debug(regs);
+	case X86_TRAP_BP: return exc_int3(regs);
+	case X86_TRAP_OF: return exc_overflow(regs);
+	case X86_TRAP_BR: return exc_bounds(regs);
+	case X86_TRAP_UD: return exc_invalid_op(regs);
+	case X86_TRAP_NM: return exc_device_not_available(regs);
+	case X86_TRAP_TS: return exc_invalid_tss(regs, error_code);
+	case X86_TRAP_NP: return exc_segment_not_present(regs, error_code);
+	case X86_TRAP_SS: return exc_stack_segment(regs, error_code);
+	case X86_TRAP_GP: return exc_general_protection(regs, error_code);
+	case X86_TRAP_PF: return exc_page_fault(regs, error_code);
+	case X86_TRAP_MF: return exc_coprocessor_error(regs);
+	case X86_TRAP_AC: return exc_alignment_check(regs, error_code);
+	case X86_TRAP_XF: return exc_simd_coprocessor_error(regs);
+#ifdef CONFIG_X86_MCE
+	case X86_TRAP_MC: return pvm_exc_machine_check(regs);
+#endif
+#ifdef CONFIG_X86_CET
+	case X86_TRAP_CP: return exc_control_protection(regs, error_code);
+#endif
+	default: return pvm_bad_event(regs, vector, error_code);
+	}
+}
+
+static noinstr void pvm_handle_INT80_compat(struct pt_regs *regs)
+{
+#ifdef CONFIG_IA32_EMULATION
+	if (ia32_enabled()) {
+		int80_emulation(regs);
+		return;
+	}
+#endif
+	exc_general_protection(regs, 0);
+}
+
+__visible noinstr void pvm_event(struct pt_regs *regs, u32 vector, u32 errcode)
+{
+	/* Optimize for #PF. */
+	if (likely(vector == (PVM_PVCS_EVENT_VECTOR_STD | X86_TRAP_PF)))
+		return exc_page_fault(regs, errcode);
+
+	if (unlikely(vector & (PVM_PVCS_EVENT_VECTOR_NMI | PVM_PVCS_EVENT_VECTOR_MCE))) {
+		if (vector & PVM_PVCS_EVENT_VECTOR_MCE)
+			pvm_exception(regs, X86_TRAP_MC, 0);
+		if (vector & PVM_PVCS_EVENT_VECTOR_NMI)
+			exc_nmi(regs);
+	}
+	if (unlikely(!(vector & PVM_PVCS_EVENT_VECTOR_STD)))
+		return;
+
+	vector &= 0xFF;
+	if (vector < NUM_EXCEPTION_VECTORS)
+		pvm_exception(regs, vector, errcode);
+	else if (unlikely(vector == IA32_SYSCALL_VECTOR))
+		pvm_handle_INT80_compat(regs);
+	else
+		external_interrupt(regs, vector);
 }
 
 void __init pvm_early_setup(void)
@@ -222,12 +346,59 @@ void __init pvm_early_setup(void)
 	pv_ops.cpu.write_msr_safe = pvm_write_msr_safe;
 	pv_ops.cpu.load_tls = pvm_load_tls;
 
+	pv_ops.irq.save_fl = __PV_IS_CALLEE_SAVE(pvm_save_fl);
+	pv_ops.irq.irq_disable = __PV_IS_CALLEE_SAVE(pvm_irq_disable);
+	pv_ops.irq.irq_enable = __PV_IS_CALLEE_SAVE(pvm_irq_enable);
+	pv_ops.irq.safe_halt = pvm_safe_halt;
+
 	this_cpu_write(pvm_guest_cr3, __native_read_cr3());
+	pv_ops.mmu.read_cr2 = __PV_IS_CALLEE_SAVE(pvm_read_cr2);
+	pv_ops.mmu.write_cr2 = pvm_write_cr2;
 	pv_ops.mmu.read_cr3 = pvm_read_cr3;
 	pv_ops.mmu.write_cr3 = pvm_write_cr3;
 	pv_ops.mmu.flush_tlb_user = pvm_flush_tlb_user;
 	pv_ops.mmu.flush_tlb_kernel = pvm_flush_tlb_kernel;
 	pv_ops.mmu.flush_tlb_one_user = pvm_flush_tlb_one_user;
+
+	/*
+	 * The boot CPU still runs on the per-CPU area in the kernel image,
+	 * where __pa() is valid; pvm_register_pvcs() moves the PVCS to the
+	 * runtime per-CPU area once GSBASE points there.
+	 */
+	wrmsrq(MSR_PVM_VCPU_STRUCT, __pa(this_cpu_ptr(&pvm_vcpu_struct)));
+}
+
+/*
+ * Register this CPU's PVCS, the pvm_vcpu_struct of its per-CPU area, with the
+ * hypervisor.  Called whenever GSBASE moves to a different per-CPU area.  The
+ * runtime per-CPU areas may be vmalloc()ed, so the physical address is looked
+ * up in the page tables.
+ */
+void pvm_register_pvcs(void)
+{
+	if (!cpu_feature_enabled(X86_FEATURE_KVM_PVM_GUEST))
+		return;
+
+	wrmsrq(MSR_PVM_VCPU_STRUCT, slow_virt_to_phys(this_cpu_ptr(&pvm_vcpu_struct)));
+}
+
+void pvm_setup_event_handling(void)
+{
+	if (!cpu_feature_enabled(X86_FEATURE_KVM_PVM_GUEST))
+		return;
+
+	pvm_register_pvcs();
+	wrmsrq(MSR_PVM_EVENT_ENTRY, (unsigned long)pvm_user_event_entry);
+	wrmsrq(MSR_PVM_RETU_RIP, (unsigned long)pvm_retu_rip);
+
+	/*
+	 * The PVM spec requires the hypervisor-maintained MSR_KERNEL_GS_BASE
+	 * to be the kernel GSBASE for event delivery from user mode.
+	 * wrmsrq(MSR_KERNEL_GS_BASE) only updates the user GSBASE in the PVCS
+	 * (see pvm_write_msr_safe()), so use the hypercall directly.
+	 */
+	pvm_hypercall2(PVM_HC_WRMSR, MSR_KERNEL_GS_BASE,
+		       cpu_kernelmode_gs_base(smp_processor_id()));
 }
 
 #ifndef CONFIG_RANDOMIZE_MEMORY

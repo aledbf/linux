@@ -562,6 +562,9 @@ SYM_INNER_LABEL(swapgs_restore_regs_and_return_to_usermode, SYM_L_GLOBAL)
 #ifdef CONFIG_XEN_PV
 	ALTERNATIVE "", "jmp xenpv_restore_regs_and_return_to_usermode", X86_FEATURE_XENPV
 #endif
+#ifdef CONFIG_PVM_GUEST
+	ALTERNATIVE "", "jmp pvm_restore_regs_and_return_to_usermode", X86_FEATURE_KVM_PVM_GUEST
+#endif
 #ifdef CONFIG_MITIGATION_PAGE_TABLE_ISOLATION
 	ALTERNATIVE "", "jmp .Lpti_restore_regs_and_return_to_usermode", X86_FEATURE_PTI
 #endif

@@ -441,7 +441,7 @@ void fred_install_sysvec(unsigned int vector, const idtentry_t function);
 void external_interrupt(struct pt_regs *regs, unsigned int vector);
 
 #define sysvec_install(vector, function) {				\
-	if (IS_ENABLED(CONFIG_X86_FRED))				\
+	if (IS_ENABLED(CONFIG_X86_FRED) || IS_ENABLED(CONFIG_PVM_GUEST)) \
 		fred_install_sysvec(vector, function);			\
 	if (!cpu_feature_enabled(X86_FEATURE_FRED))			\
 		idt_install_sysvec(vector, asm_##function);		\
