@@ -2,12 +2,14 @@
 #ifndef _ASM_X86_KVM_TYPES_H
 #define _ASM_X86_KVM_TYPES_H
 
-#if IS_MODULE(CONFIG_KVM_AMD) && IS_MODULE(CONFIG_KVM_INTEL)
-#define KVM_SUB_MODULES kvm-amd,kvm-intel
-#elif IS_MODULE(CONFIG_KVM_AMD)
-#define KVM_SUB_MODULES kvm-amd
-#elif IS_MODULE(CONFIG_KVM_INTEL)
-#define KVM_SUB_MODULES kvm-intel
+/*
+ * The namespace is an allowlist of importing modules; naming a module that is
+ * not built has no effect, so list all vendor modules whenever at least one of
+ * them is modular instead of enumerating every combination.
+ */
+#if IS_MODULE(CONFIG_KVM_AMD) || IS_MODULE(CONFIG_KVM_INTEL) || \
+    IS_MODULE(CONFIG_KVM_PVM)
+#define KVM_SUB_MODULES kvm-amd,kvm-intel,kvm-pvm
 #else
 #undef KVM_SUB_MODULES
 /*

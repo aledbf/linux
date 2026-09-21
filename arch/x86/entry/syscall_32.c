@@ -4,6 +4,7 @@
 #include <linux/linkage.h>
 #include <linux/sys.h>
 #include <linux/cache.h>
+#include <linux/kvm_types.h>
 #include <linux/syscalls.h>
 #include <linux/entry-common.h>
 #include <linux/nospec.h>
@@ -61,6 +62,7 @@ static __always_inline long syscall_32_enter(struct pt_regs *regs)
 
 #ifdef CONFIG_IA32_EMULATION
 bool __ia32_enabled __ro_after_init = !IS_ENABLED(CONFIG_IA32_EMULATION_DEFAULT_DISABLED);
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(__ia32_enabled);
 
 static int __init ia32_emulation_override_cmdline(char *arg)
 {

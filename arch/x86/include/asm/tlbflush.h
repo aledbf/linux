@@ -59,13 +59,16 @@ static inline void cr4_clear_bits(unsigned long mask)
 	local_irq_restore(flags);
 }
 
-#ifndef MODULE
 /*
  * 6 because 6 should be plenty and struct tlb_state will fit in two cache
  * lines.
+ *
+ * Outside MODULE because a module that hands the hardware a PCID of its own --
+ * the PVM switcher does -- has to know which ones the host has already taken.
  */
 #define TLB_NR_DYN_ASIDS	6
 
+#ifndef MODULE
 struct tlb_context {
 	u64 ctx_id;
 	u64 tlb_gen;

@@ -1495,6 +1495,7 @@ SYM_CODE_START(entry_SYSCALL32_ignore)
 	CLEAR_CPU_BUFFERS
 	sysretl
 SYM_CODE_END(entry_SYSCALL32_ignore)
+EXPORT_SYMBOL_FOR_KVM_INTERNAL(entry_SYSCALL32_ignore)
 
 .pushsection .text, "ax"
 	__FUNC_ALIGN
