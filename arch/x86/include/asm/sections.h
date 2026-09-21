@@ -17,4 +17,7 @@ extern char __end_of_kernel_reserve[];
 
 extern unsigned long _brk_start, _brk_end;
 
+/* The end of the space the relocs tool fills with the relocation table. */
+extern char __relocation_end[];
+
 #endif	/* _ASM_X86_SECTIONS_H */

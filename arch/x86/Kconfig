@@ -2055,6 +2055,33 @@ config RELOCATABLE
 	  it has been loaded at and the compile time physical address
 	  (CONFIG_PHYSICAL_START) is used as the minimum location.
 
+config RELOCATABLE_UNCOMPRESSED_KERNEL
+	def_bool y
+	depends on X86_PIE
+	help
+	  Embed a table of relocation data in the uncompressed kernel
+	  image, which the kernel can walk at boot to relocate itself to a
+	  virtual address other than the one it was linked at.  The table
+	  is in init memory and is gone once that is freed.
+
+	  The table has the decompressor's format: each entry holds the low
+	  32 bits of the link-time address to fix up, which the reader
+	  sign-extends.  That works because vmlinux is still linked in the
+	  top 2GB; only where it runs may differ.
+
+config RELOCATION_TABLE_SIZE
+	hex "Relocation table size"
+	depends on RELOCATABLE_UNCOMPRESSED_KERNEL
+	range 0x1000 0x01000000
+	default "0x00200000"
+	help
+	  The space reserved in vmlinux for the relocation table, 4 bytes
+	  for each 64-bit absolute relocation plus two terminators.
+
+	  The build fails and prints the size needed if this is too small.
+
+	  If unsure, leave at the default value.
+
 config X86_PIE
 	bool "Build a position-independent kernel" if EXPERT
 	depends on X86_64
@@ -2119,7 +2146,10 @@ config RANDOMIZE_BASE
 # Relocation on x86 needs some additional build support
 config X86_NEED_RELOCS
 	def_bool y
-	depends on RANDOMIZE_BASE || (X86_32 && RELOCATABLE)
+	# RELOCATABLE_UNCOMPRESSED_KERNEL needs --emit-relocs for
+	# arch/x86/Makefile.postlink to build the table.
+	depends on RANDOMIZE_BASE || (X86_32 && RELOCATABLE) || \
+		   RELOCATABLE_UNCOMPRESSED_KERNEL
 	select ARCH_VMLINUX_NEEDS_RELOCS
 
 config PHYSICAL_ALIGN

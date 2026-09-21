@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-2.0
+# ===========================================================================
+# Post-link x86 pass
+# ===========================================================================
+#
+# Insert the relocation table into vmlinux.unstripped, so that an
+# uncompressed kernel can relocate itself at boot.
+
+PHONY := __archpost
+__archpost:
+
+-include include/config/auto.conf
+include $(srctree)/scripts/Kbuild.include
+
+CMD_RELOCS = arch/x86/tools/relocs
+quiet_cmd_insert_relocs = RELOCS  $@
+      cmd_insert_relocs = $(CMD_RELOCS) --keep $@
+
+# `@true` prevents complaint when there is nothing to be done
+
+vmlinux.unstripped: FORCE
+	@true
+ifeq ($(CONFIG_RELOCATABLE_UNCOMPRESSED_KERNEL),y)
+	$(call cmd,insert_relocs)
+endif
+
+clean:
+	@true
+
+PHONY += FORCE clean
+
+FORCE:
+
+.PHONY: $(PHONY)

@@ -298,6 +298,22 @@ SECTIONS
 	}
 #endif
 
+#ifdef CONFIG_RELOCATABLE_UNCOMPRESSED_KERNEL
+	. = ALIGN(4);
+	.data.reloc : AT(ADDR(.data.reloc) - LOAD_OFFSET) {
+		/*
+		 * Space for the relocation table, overwritten in place by the
+		 * relocs tool at post-link time.  The leading word keeps this
+		 * from becoming a NOBITS section.  This is init memory: the
+		 * table can only be used before free_initmem().
+		 */
+		LONG(0);
+		FILL(0);
+		. += CONFIG_RELOCATION_TABLE_SIZE - 4;
+		__relocation_end = .;
+	}
+#endif
+
 	/*
 	 * struct alt_inst entries. From the header (alternative.h):
 	 * "Alternative instructions for different CPU types or capabilities"
